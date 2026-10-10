@@ -2,6 +2,9 @@
 out/
 *.log
 
+# 从设备拉下来的分析素材（含宿主播放历史等隐私数据，绝不入库）
+ref/
+
 # 签名中间产物（只要最终 APK）
 dist/*.idsig
 dist/*.apk.idsig

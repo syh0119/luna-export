@@ -2,22 +2,29 @@
 <!--
   一个 APK 两种用法：
     · LSPosed 模块 —— xposedmodule / xposeddescription / xposedscope + assets/xposed_init
-    · 普通应用     —— launcher Activity，用 su 读宿主私有目录
+    · 普通应用     —— launcher Activity + FloatService（浮窗）
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.syh.luna"
-    android:versionCode="1"
-    android:versionName="1.0.0">
+    android:versionCode="2"
+    android:versionName="1.1.0">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <!--
+      「所有文件访问」：有它才能把 .lrc 直接写在歌曲旁边（/sdcard/Music/汽水导出/）。
+      没有它时 Android 11+ 只允许把非媒体文件放 Download/ 下。
+      用户需在系统设置里手动授予（App 内已提供入口）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="false"
         android:debuggable="true"
+        android:largeHeap="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="汽水导出"
@@ -35,13 +42,16 @@
             </intent-filter>
         </activity>
 
-        <!-- ===== LSPosed 模块声明 ===== -->
+        <!-- ===== LSPosed 模块声明 =====
+             模块在宿主进程里**只做被动抓取**：把网络响应里的加密密钥（encrypt_info.spade_a）
+             与曲目元数据收进几十 KB 的缓存文件，不产生歌曲、不加界面、不常驻。
+             导出本身完全由本 App 自己完成（root 模式读私有目录 → 离线解密）。 -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="汽水音乐导出：在宿主进程内直接读取 /data/data/com.luna.music 的 .mdl，离线解密 CENC(AES-128-CTR) 为无损 FLAC / M4A，写入 标题·歌手·专辑·歌词·封面 后输出到 Music/汽水导出/；并 hook 响应体被动补齐加密密钥。同一 APK 也可作为普通应用（root 模式）使用。" />
+            android:value="被动抓取加密密钥与曲目元数据（每次几十 KB，不产生歌曲、不加界面）。导出全部由本 App 自己完成：用 root 读汽水音乐私有目录里的 .mdl，离线解密 CENC(AES-128-CTR) 为无损 FLAC / M4A，写入 标题·歌手·专辑·歌词·封面 后输出到 Music/汽水导出/。" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

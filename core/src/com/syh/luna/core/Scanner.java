@@ -23,9 +23,16 @@ public final class Scanner {
     public static final Pattern RE_MD5KEY =
             Pattern.compile("^(v[0-9a-zA-Z]{10,})\\|([^|]*)\\|([0-9a-f]{32})$");
     private static final Pattern RE_JSON_START = Pattern.compile("[\\{\\[]");
+    /** 32 位十六进制 —— 宿主用 file_hash 表示 .mdl 的文件名 */
+    private static final Pattern RE_MD5 = Pattern.compile("^[0-9a-fA-F]{32}$");
 
     private final Index idx = new Index();
     private final Map<String, Set<String>> md5sets = new LinkedHashMap<String, Set<String>>();
+
+    /** 当前 blob 里出现过的 `file_hash`（就是 .mdl 的文件名） */
+    private final List<String> curHashes = new ArrayList<String>();
+    /** 当前 blob 里出现过的 track vid */
+    private final List<String> curVids = new ArrayList<String>();
 
     public int blobCount;
     public int jsonCount;
@@ -53,28 +60,77 @@ public final class Scanner {
     /** 单个 blob 最多尝试多少个起点 */
     private static final int MAX_TRY = 40000;
 
+    /** 一次性扫一批。**注意**：这要求调用方把所有 blob 同时留在内存里 ——
+     *  宿主的索引目录有 28 MB+（读成 String 还要翻倍），而 com.luna.music 是
+     *  **32 位进程**，很容易被撑爆。能用 {@link #feed} 就优先用。 */
     public static Scanner scan(List<String> blobs) {
         Scanner s = new Scanner();
-        s.blobCount = blobs.size();
-        for (String b : blobs) {
-            Matcher m = RE_JSON_START.matcher(b);
-            int from = 0, budget = BUDGET, tries = 0;
-            while (from < b.length() && budget > 0 && tries < MAX_TRY && m.find(from)) {
-                int st = m.start();
-                if (b.length() - st < 30) break;
-                tries++;
-                Json.Prefix p = Json.parsePrefix(b, st);
-                if (p == null) {
-                    from = st + 1;          // 这个 '{' 不是合法 JSON 起点，往后挪一格
-                    continue;
-                }
-                s.walkJson(p.value, 0);
-                s.jsonCount++;
-                budget -= p.consumed;
-                from = st + p.consumed;     // 跳过已吃掉的部分，继续找下一个
-            }
+        for (String b : blobs) s.feed(b);
+        s.finish();
+        return s;
+    }
+
+    /**
+     * 逐条喂入 —— 调用方读完一条即可丢弃，峰值只等于「最大的一条 blob」。
+     * 这是给 Android 侧准备的（见 IndexBuilder）。
+     */
+    public void feed(String b) {
+        if (b == null || b.isEmpty()) return;
+        blobCount++;
+        curHashes.clear();
+        curVids.clear();
+        scanText(b);
+
+        // 宿主的 `playableJson` 里**嵌着被转义的 JSON**：
+        //     "...l=2026...\"video_meta\":{\"file_hash\":\"2a42224df81e...\"}..."
+        // 原文扫不出这段（它在字符串值内部），所以把 \" 还原成 " 再扫一遍 ——
+        // 这样才拿得到 file_hash，也就是 .mdl 的文件名。
+        // 这是「有密钥、能导出、但歌名查不出来」的根因。
+        if (b.indexOf("\\\"") >= 0 && b.length() < (1 << 20)) {
+            scanText(b.replace("\\\"", "\""));
         }
-        for (Map.Entry<String, Set<String>> e : s.md5sets.entrySet()) {
+        linkHashes();
+    }
+
+    /** 在文本里反复抠 JSON 片段，逐个 walk */
+    private void scanText(String b) {
+        Matcher m = RE_JSON_START.matcher(b);
+        int from = 0, budget = BUDGET, tries = 0;
+        while (from < b.length() && budget > 0 && tries < MAX_TRY && m.find(from)) {
+            int st = m.start();
+            if (b.length() - st < 30) break;
+            tries++;
+            Json.Prefix p = Json.parsePrefix(b, st);
+            if (p == null) {
+                from = st + 1;          // 这个 '{' 不是合法 JSON 起点，往后挪一格
+                continue;
+            }
+            walkJson(p.value, 0);
+            jsonCount++;
+            budget -= p.consumed;
+            from = st + p.consumed;     // 跳过已吃掉的部分，继续找下一个
+        }
+    }
+
+    /**
+     * 把「同一条记录里的 file_hash」和「同一条记录里的 track vid」关联起来。
+     *
+     * 一条 `playableJson` 描述的就是一首歌，所以里面的 file_hash 和 track 必然同源。
+     * 只在**恰好一个 vid** 时才关联（有歌单混进来时宁可不做，也别连错）。
+     */
+    private void linkHashes() {
+        if (curHashes.isEmpty() || curVids.size() != 1) return;
+        String vid = curVids.get(0);
+        for (String h : curHashes) {
+            Set<String> set = md5sets.get(h);
+            if (set == null) { set = new LinkedHashSet<String>(); md5sets.put(h, set); }
+            set.add(vid + "\u0000" + "lossless");
+        }
+    }
+
+    /** 收尾：把攒下的 md5→vid 集合落进索引 */
+    public Index finish() {
+        for (Map.Entry<String, Set<String>> e : md5sets.entrySet()) {
             List<String> l = new ArrayList<String>(e.getValue());
             Collections.sort(l);
             List<String[]> out = new ArrayList<String[]>();
@@ -82,9 +138,10 @@ public final class Scanner {
                 int p = v.indexOf('\u0000');
                 out.add(new String[]{v.substring(0, p), v.substring(p + 1)});
             }
-            s.idx.md5toVid.put(e.getKey(), out);
+            idx.md5toVid.put(e.getKey(), out);
         }
-        return s;
+        md5sets.clear();        // 已经搬进 idx，别留着占内存
+        return idx;
     }
 
     @SuppressWarnings("unchecked")
@@ -97,6 +154,10 @@ public final class Scanner {
             if (m.get("spade_a") instanceof String) noteEncrypt(m, null);
             if (m.get("track") instanceof Map) noteTrack((Map<String, Object>) m.get("track"));
             if (m.containsKey("video_list")) noteVideoModel(m, null);
+            // file_hash = .mdl 的文件名；和同一条记录里的 track 关联后就能补出 md5→vid
+            Object fh = m.get("file_hash");
+            if (fh instanceof String && RE_MD5.matcher((String) fh).matches()
+                    && !curHashes.contains(fh)) curHashes.add((String) fh);
             for (Map.Entry<String, Object> e : m.entrySet()) {
                 Matcher mm = RE_MD5KEY.matcher(e.getKey());
                 if (mm.matches()) {
@@ -139,6 +200,7 @@ public final class Scanner {
         if (t == null) return;
         String vid = Json.str(t, "vid");
         if (vid == null || vid.isEmpty()) return;
+        if (!curVids.contains(vid)) curVids.add(vid);
         Map<String, Object> m = idx.vidMeta.get(vid);
         if (m == null) { m = new LinkedHashMap<String, Object>(); idx.vidMeta.put(vid, m); }
 

@@ -21,8 +21,12 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import android.os.Handler;
+import android.os.Looper;
+
 import com.syh.luna.android.Dirs;
 import com.syh.luna.android.Exporter;
+import com.syh.luna.android.Logx;
 
 import java.io.File;
 import java.io.InputStream;
@@ -74,9 +78,21 @@ public final class Overlay {
     /** 悬浮球图标（从本模块自己的 APK assets 里读，宿主进程也能拿到） */
     private static volatile Bitmap ICON;
 
-    private final Activity act;
+    /** 建 View 必须回主线程。用 Handler 而不是 Activity.runOnUiThread，Service 才能复用这套 UI */
+    private final Handler UI = new Handler(Looper.getMainLooper());
+
+    private final Context act;          // 只用它的 Resources / getSystemService
+    /** 非 null = 挂在宿主 Activity 上（LSPosed 模式）。我们自己的浮窗传 null */
+    private final Activity hostAct;
     private final Context ctx;
     private final boolean dark;
+    /**
+     * 取数方式。
+     * hostAct == null（我们自己的 App）→ **必须走 root**：我们 uid 不同，
+     * 只能请 su 把 /data/user/0/com.luna.music 暂存到 /data/local/tmp 再读。
+     * 这正是 v1.0.0 里已经验证可用的那条路（不会碰宿主的堆）。
+     */
+    private final boolean rootMode;
 
     private WindowManager wm;
     private WindowManager.LayoutParams lp;
@@ -93,56 +109,88 @@ public final class Overlay {
     private Exporter.Session session;
     private final StringBuilder logBuf = new StringBuilder(4096);
 
-    private Overlay(Activity a) {
-        this.act = a;
-        this.ctx = a.getApplicationContext();
-        this.dark = isDark(a);
+    private Overlay(Context c, Activity host) {
+        this.act = c;
+        this.hostAct = host;
+        Context app = c.getApplicationContext();
+        this.ctx = app != null ? app : c;
+        this.dark = isDark(c);
+        this.rootMode = (host == null);
     }
 
-    // ================================================================== 生命周期入口
+    // ================================================================== 入口
 
-    /** 宿主某个 Activity 走到前台时调用；只对目标包生效，且全局只保留一个浮层 */
+    /**
+     * ⚠️ **宿主内浮层已停用。**
+     *
+     * 不是功能做不出来，是**宿主扛不住**：com.luna.music 的 `ABI: 'arm'` 是 32 位进程，
+     * 基线常驻就占 1.1 GB RSS；而建索引要读 28 MB+ / 546 个缓存文件、解密一首无损要
+     * 40~60 MB。实测把宿主撑到 RSS 1.4 GB，它自己的图片管线直接
+     * `OutOfMemoryError: decode out of memory` 崩掉，导出线程死在写盘中间，
+     * 目录里留下 0 字节的 `.pending-*` 文件。用户侧看到的就是「点了没反应 + 卡死」。
+     *
+     * 所以改成 **App 为主**：重活全部回到 com.syh.luna 自己的进程（独立堆、
+     * 可以 largeHeap），浮窗也由我们自己的前台 Service 起（见 {@link #show}）。
+     * 宿主这边只保留**被动抓密钥/元数据**这种几十 KB 的轻活。
+     */
     public static void onActivityResumed(Activity a) {
-        if (a == null) return;
-        try {
-            if (!Dirs.PKG.equals(a.getPackageName())) return;
-            synchronized (LOCK) {
-                if (HOST_ACT == a && INSTANCE != null) return;    // 已经挂在这个 Activity 上
-                if (INSTANCE != null) INSTANCE.detach();
-                Overlay o = new Overlay(a);
-                if (o.install()) { INSTANCE = o; HOST_ACT = a; }
-                else { INSTANCE = null; HOST_ACT = null; }
-            }
-        } catch (Throwable t) {
-            MainHook.log("Overlay.resumed: " + t);
+        // 故意空实现：保留签名，避免旧调用点编译不过。
+    }
+
+    public static void onActivityDestroyed(Activity a) { }
+
+    /**
+     * 起我们自己的浮窗（由前台 Service 调用）。
+     *
+     * 与宿主模式的区别：
+     *   · 窗口类型 TYPE_APPLICATION_OVERLAY，需要用户授予「显示在其他应用上层」；
+     *   · **扫描/导出都在我们自己的进程里跑**，不再动宿主那个 32 位大堆。
+     */
+    public static void show(Context c) {
+        if (c == null) return;
+        // 建 View 必须在主线程：调用方可能是 Service 的 onStartCommand（主线程），
+        // 也可能是我们自己的监听线程 —— 统一收敛到主线程。
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            showOnMain(c);
+        } else {
+            final Context cc = c;
+            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                public void run() { showOnMain(cc); }
+            });
         }
     }
 
-    public static void onActivityDestroyed(Activity a) {
+    private static void showOnMain(Context c) {
         synchronized (LOCK) {
-            if (HOST_ACT == a && INSTANCE != null) {
+            if (INSTANCE != null) return;
+            Overlay o = new Overlay(c, null);
+            if (o.install()) INSTANCE = o;
+        }
+    }
+
+    public static void hide() {
+        synchronized (LOCK) {
+            if (INSTANCE != null) {
                 INSTANCE.detach();
                 INSTANCE = null;
-                HOST_ACT = null;
             }
         }
     }
 
-    /** 仅供「汽水导出」App 自己预览界面用（带 --ez overlay true 启动） */
-    public static void preview(Activity a) {
-        synchronized (LOCK) {
-            if (INSTANCE != null) INSTANCE.detach();
-            Overlay o = new Overlay(a);
-            if (o.install()) { INSTANCE = o; HOST_ACT = a; }
-        }
-    }
+    public static boolean isShown() { return INSTANCE != null; }
 
     // ================================================================== 挂载 / 摘除
 
     private boolean install() {
         try {
             buildViews();
-            final View decor = act.getWindow().getDecorView();
+            if (hostAct == null) {                 // 我们自己 App 的浮窗
+                boolean ok = tryOverlay();
+                postLog(ok ? "浮窗已就位 · 在 App 自己的进程里跑"
+                           : "浮窗挂载失败：请在系统设置里授予「显示在其他应用上层」权限");
+                return ok;
+            }
+            final View decor = hostAct.getWindow().getDecorView();
             // ⚠️ onActivityResumed 是在 handleResumeActivity 里调的，窗口此刻还没 addView，
             //    所以 getWindowToken() 必然是 null —— 直接放弃会让我们永远只能退化到 DecorView。
             //    这里 post 一拍（并按帧重试几次），等窗口真正 attach 再用 APPLICATION_PANEL。
@@ -164,7 +212,29 @@ public final class Overlay {
             decor.postDelayed(attach, decor.getWindowToken() == null ? 120 : 0);
             return true;
         } catch (Throwable t) {
-            MainHook.log("Overlay.install 失败: " + t);
+            Logx.i("Overlay.install 失败: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * 我们自己的浮窗：TYPE_APPLICATION_OVERLAY。
+     * 权限按 uid 检查 —— 这里是我们自己的 uid，只要用户授予过「显示在其他应用上层」就能用。
+     * （在宿主进程里绝不能用这个类型：汽水音乐虽声明了 SYSTEM_ALERT_WINDOW，appops 实际是 default。）
+     */
+    private boolean tryOverlay() {
+        try {
+            WindowManager.LayoutParams p = baseParams();
+            p.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+            WindowManager w = (WindowManager) act.getSystemService(Context.WINDOW_SERVICE);
+            if (w == null) return false;
+            w.addView(root, p);
+            wm = w;
+            lp = p;
+            viaDecor = false;
+            return true;
+        } catch (Throwable t) {
+            Logx.i("APPLICATION_OVERLAY 挂载失败: " + t);
             return false;
         }
     }
@@ -172,23 +242,24 @@ public final class Overlay {
     /** 首选：WindowManager + TYPE_APPLICATION_PANEL（不占宿主排版） */
     private boolean tryPanel() {
         try {
-            View decor = act.getWindow().getDecorView();
+            View decor = hostAct.getWindow().getDecorView();
             android.os.IBinder token = decor.getWindowToken();
             if (token == null) {
-                MainHook.log("窗口令牌未就绪，走 DecorView 兜底");
+                Logx.i("窗口令牌未就绪，走 DecorView 兜底");
                 return false;
             }
             WindowManager.LayoutParams p = baseParams();
             p.type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
             p.token = token;
-            WindowManager w = act.getWindowManager();
+            WindowManager w = (WindowManager) act.getSystemService(Context.WINDOW_SERVICE);
+            if (w == null) return false;
             w.addView(root, p);
             wm = w;
             lp = p;
             viaDecor = false;
             return true;
         } catch (Throwable t) {
-            MainHook.log("APPLICATION_PANEL 挂载失败(" + t + ")，退化 DecorView");
+            Logx.i("APPLICATION_PANEL 挂载失败(" + t + ")，退化 DecorView");
             return false;
         }
     }
@@ -196,7 +267,7 @@ public final class Overlay {
     /** 兜底：直接挂到 DecorView 末尾（在宿主内容之上，同样无需权限） */
     private boolean tryDecor() {
         try {
-            View decor = act.getWindow().getDecorView();
+            View decor = hostAct.getWindow().getDecorView();
             if (!(decor instanceof ViewGroup)) return false;
             FrameLayout.LayoutParams fp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -211,15 +282,15 @@ public final class Overlay {
             lp = null;
             return true;
         } catch (Throwable t) {
-            MainHook.log("DecorView 兜底也失败: " + t);
+            Logx.i("DecorView 兜底也失败: " + t);
             return false;
         }
     }
 
     void detach() {
         try {
-            if (viaDecor) {
-                View decor = act.getWindow().getDecorView();
+            if (viaDecor && hostAct != null) {
+                View decor = hostAct.getWindow().getDecorView();
                 if (decor instanceof ViewGroup && root != null) ((ViewGroup) decor).removeView(root);
             } else if (wm != null && root != null) {
                 wm.removeView(root);
@@ -412,7 +483,11 @@ public final class Overlay {
         c.addView(stat1);
         c.addView(stat2);
 
-        prog = line(11.5f, ACCENT, false);
+        // 进度条：做成一条醒目的状态栏，别只是角落里一行小字
+        prog = line(12.5f, ACCENT, false);
+        prog.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        prog.setPadding(dp(10), dp(7), dp(10), dp(7));
+        prog.setBackground(round(dark ? FILL_D : FILL_L, 9, 0, 0));
         prog.setVisibility(View.GONE);
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -506,7 +581,7 @@ public final class Overlay {
     /** 线程安全入口：建 View 必须在主线程（扫描/导出都在后台线程里调它） */
     private void rebuildList() {
         if (act == null) return;
-        act.runOnUiThread(new Runnable() {
+        UI.post(new Runnable() {
             public void run() { rebuildListNow(); }
         });
     }
@@ -628,7 +703,7 @@ public final class Overlay {
         if (s == null || s.error != null) return;
         final int n = s.selectedExportable().size();
         final int total = s.countExportable();
-        act.runOnUiThread(new Runnable() {
+        UI.post(new Runnable() {
             public void run() {
                 if (btnExport != null) {
                     btnExport.setText(n > 0 ? ("导出选中 " + n + " 首") : "导出选中");
@@ -704,7 +779,7 @@ public final class Overlay {
 
     private void toggle(boolean open) {
         if (root == null) return;
-        MainHook.log("浮层 " + (open ? "展开" : "收起"));
+        Logx.i("浮层 " + (open ? "展开" : "收起"));
         expanded = open;
         ball.setVisibility(open ? View.GONE : View.VISIBLE);
         card.setVisibility(open ? View.VISIBLE : View.GONE);
@@ -750,12 +825,12 @@ public final class Overlay {
 
     private void doScan() {
         if (busy) { postLog("正在忙，稍等 …"); return; }
-        busy = true;
+        setBusy(true);
         setProg("正在扫描 …");
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    Exporter.Session s = Exporter.prepare(ctx, false, logger, progressor);
+                    Exporter.Session s = Exporter.prepare(ctx, rootMode, logger, progressor);
                     if (s.error != null) {
                         postLog("✗ " + s.error);
                         setStat("扫描失败", s.error);
@@ -771,14 +846,14 @@ public final class Overlay {
                     int c = 0;
                     for (Exporter.Item it : s.items) {
                         if (!it.exportable()) continue;
-                        MainHook.log("META " + (++c) + " " + it.md5.substring(0, 8)
+                        Logx.i("META " + (++c) + " " + it.md5.substring(0, 8)
                                 + " | title=" + it.title + " | artist=" + it.artist
                                 + " | vid=" + s.idx.md5toVid.get(it.md5));
                     }
                 } catch (Throwable t) {
                     postLog("✗ 扫描异常: " + t);
                 } finally {
-                    busy = false;
+                    setBusy(false);
                     clearProg();
                 }
             }
@@ -807,7 +882,7 @@ public final class Overlay {
 
     private void runExport(final List<Exporter.Item> chosen, final String label) {
         if (busy) { postLog("正在忙，稍等 …"); return; }
-        busy = true;
+        setBusy(true);
         setProg("导出 " + label + " …");
         new Thread(new Runnable() {
             public void run() {
@@ -818,7 +893,7 @@ public final class Overlay {
                 } catch (Throwable t) {
                     postLog("✗ 导出异常: " + t);
                 } finally {
-                    busy = false;
+                    setBusy(false);
                     clearProg();
                     rebuildList();      // 行内状态（已导出）要刷新
                     refreshStatus();
@@ -896,13 +971,13 @@ public final class Overlay {
                     Bitmap bm = BitmapFactory.decodeByteArray(d, 0, d.length);
                     if (bm != null) {
                         ICON = bm;
-                        MainHook.log("悬浮球图标已加载 " + bm.getWidth() + "x" + bm.getHeight()
+                        Logx.i("悬浮球图标已加载 " + bm.getWidth() + "x" + bm.getHeight()
                                 + "（" + d.length + " 字节）");
                     }
                 }
-                if (ICON == null) MainHook.log("悬浮球图标未取到，用蓝色圆兜底");
+                if (ICON == null) Logx.i("悬浮球图标未取到，用蓝色圆兜底");
             } catch (Throwable t) {
-                MainHook.log("加载悬浮球图标异常: " + t);
+                Logx.i("加载悬浮球图标异常: " + t);
             }
             return ICON;
         }
@@ -969,7 +1044,7 @@ public final class Overlay {
     }
 
     private void setStat(final String a, final String b) {
-        act.runOnUiThread(new Runnable() {
+        UI.post(new Runnable() {
             public void run() {
                 if (stat1 != null) stat1.setText(a);
                 if (stat2 != null) stat2.setText(b);
@@ -978,24 +1053,46 @@ public final class Overlay {
     }
 
     private void setProg(final String s) {
-        act.runOnUiThread(new Runnable() {
+        UI.post(new Runnable() {
             public void run() {
                 if (prog != null) { prog.setText(s); prog.setVisibility(View.VISIBLE); }
+                // 主按钮同步显示进度，这样不用盯着小字也能看出在动
+                if (busy && btnExport != null) btnExport.setText(s);
             }
         });
     }
 
     private void clearProg() {
-        act.runOnUiThread(new Runnable() {
+        UI.post(new Runnable() {
             public void run() {
                 if (prog != null) prog.setVisibility(View.GONE);
+                refreshSel();
+            }
+        });
+    }
+
+    /**
+     * 忙时把按钮全部锁住。
+     * 之前重复点「导出选中」会连开多个导出线程（各自把 40MB 的曲目读进来解密），
+     * 在 32 位宿主里直接把内存顶爆 —— 现在按钮直接不可点，并给出可见状态。
+     */
+    private void setBusy(final boolean b) {
+        busy = b;
+        UI.post(new Runnable() {
+            public void run() {
+                for (TextView t : new TextView[]{btnScan, btnSelect, btnExport, btnAll}) {
+                    if (t == null) continue;
+                    t.setEnabled(!b);
+                    t.setAlpha(b ? 0.45f : 1f);
+                }
+                if (b && btnExport != null) btnExport.setText("处理中…");
             }
         });
     }
 
     private void postLog(final String s) {
-        MainHook.log(s);
-        act.runOnUiThread(new Runnable() {
+        Logx.i(s);
+        UI.post(new Runnable() {
             public void run() {
                 logBuf.append(s).append('\n');
                 if (logBuf.length() > 2000) logBuf.delete(0, logBuf.length() - 2000);
@@ -1043,7 +1140,7 @@ public final class Overlay {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
-    private static boolean isDark(Activity a) {
+    private static boolean isDark(Context a) {
         try {
             return (a.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                     == Configuration.UI_MODE_NIGHT_YES;

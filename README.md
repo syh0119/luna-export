@@ -3,16 +3,12 @@
 `com.luna.music` 的 `.mdl`（CENC / AES-128-CTR）**在手机本地解密**，输出无损 FLAC / M4A，
 写入 标题·歌手·专辑·歌词·封面，产出到 `/sdcard/Music/汽水导出/`。
 
-**一个 APK，两种用法**：既是 LSPosed 模块，也是能点开启动的普通应用。
+**一个 APK 两个身份**：
+- **普通 App**（主形态）—— 点桌面图标打开，扫描 → 勾选 → 导出。全部在 App 自己的进程里跑。
+- **LSPosed 模块**（可选）—— 只在宿主进程里做**被动抓取**：把网络响应里的加密密钥与曲目元数据
+  收进几十 KB 的缓存文件。**不产生歌曲、不加界面、不常驻。**
+
 **不主动点导出，就绝不会往 `/sdcard` 写任何歌曲。**
-
-点悬浮球就地读写，**不用切应用**：
-
-![宿主内浮层](doc/preview_浮层.png)
-
-![悬浮球](doc/preview_悬浮球.png)
-
-> 完整截图见 [`doc/`](doc/)。
 
 ---
 
@@ -20,10 +16,10 @@
 
 ```
 com.syh.luna                         ← 一个 APK
-├─ assets/xposed_init → com.syh.luna.lsp.MainHook      LSPosed 入口
+├─ assets/xposed_init → com.syh.luna.lsp.MainHook      LSPosed 入口（只做被动抓取）
 ├─ manifest: xposedmodule / xposeddescription /
 │            xposedminversion / xposedscope(com.luna.music)
-└─ MainActivity（launcher）                           普通应用入口
+└─ MainActivity（launcher）                            App 入口
 ```
 
 ## 设计原则：不主动点，就绝不落盘
@@ -31,44 +27,43 @@ com.syh.luna                         ← 一个 APK
 **这是本工具最重要的一条规则。** 自动导出会在你只是正常听歌 / 浏览歌单时也把曲目解密落盘到
 `/sdcard`，白占空间。所以：
 
-- LSPosed 模块**没有**「宿主启动自动导出」；
-- 独立 App 的「启动时自动增量导出」开关**默认关闭**（截图 `doc/05_默认不自动导出.png`）；
+- LSPosed 模块**没有**「宿主启动自动导出」，也没有任何界面；
+- App 的「启动时自动增量导出」开关**默认关闭**；
 - 打开应用、听歌、浏览——都**不会**产出任何文件；实测确认输出目录在只打开应用时根本不会被创建。
 
-产出文件的唯一途径是你**显式**动作：点「导出选中」，或发出一次导出广播。
+产出文件的唯一途径是你**显式**点「导出选中」。
 
 ### 装上后
 
-| 用法 | 怎么用 | 能力 |
+| 身份 | 怎么用 | 能力 |
 |---|---|---|
-| **LSPosed 模块（推荐）** | LSPosed → 模块 → 启用「汽水导出」→ 作用域勾「汽水音乐」→ 重启宿主即可 | ① 在**汽水音乐自己的界面里挂一个悬浮球**，点开就是可勾选的曲目列表，**就地导出，不用切 App**（免 su）② **被动抓密钥**（只读网络响应里的 `spade_a`）③ **被动补元数据**（见下）④ 支持广播手动触发 |
-| **普通应用** | 直接点桌面图标 | 用 `su` 读私有目录，独立界面里 扫描 → 勾选 → 导出 |
+| **普通 App（主）** | 直接点桌面图标 | 用 `su` 读汽水音乐私有目录 → 离线解密 → 写标签 → 落到 `Music/汽水导出/`。扫描 → 勾选 → 导出 |
+| **LSPosed 模块（可选）** | LSPosed → 模块 → 启用「汽水导出」→ 作用域勾「汽水音乐」→ 重启宿主 | **只做被动抓取**：① 抓 `encrypt_info.spade_a` ② 攒曲目元数据。两者合计每次几十 KB，**不产歌曲、不加界面、不常驻** |
 
-### 浮层（moonhook 式内嵌）
+> 这个 hook 的唯一价值：汽水音乐只在「播放过 / 完整下载过」的歌上缓存 key。
+> 被动把这些收下来，本地没缓存到的歌也能解开（实测密钥库从 390 涨到 556 条）。
 
-代码本来就跑在宿主进程里，所以直接往宿主窗口上挂一层 View 就行：
+### 为什么不做「浮窗」
 
-- 挂载点用 `Application.registerActivityLifecycleCallbacks` —— **不 hook 任何混淆类名**，宿主改版也不受影响。
-- 窗口用 `TYPE_APPLICATION_PANEL` + 宿主窗口 token。
-  **不能用 `TYPE_APPLICATION_OVERLAY`**：权限按 uid 检查，而汽水音乐虽然声明了
-  `SYSTEM_ALERT_WINDOW`，appops 实际是 `default`（未授予）。
-- 悬浮球图标读自**本模块自己的 APK** 的 `assets/luna-icon.png`。
-- **标题栏「汽水导出」那一行是拖动把手**，球和卡片的位置分开记；列表里只有「可导出」的曲目。
+试过，**撤了**。三个都写在这里，免得以后重复踩：
 
-> ⚠️ `onActivityResumed` 触发时窗口还没 attach，`getWindowToken()` 必为 null。
-> 代码会 `postDelayed` 重试几次再挂载，否则只能退化成 DecorView 兜底。
+| 试过的方案 | 结果 |
+|---|---|
+| **宿主内浮层**（`TYPE_APPLICATION_PANEL` + 宿主 token） | 功能能跑，但**宿主扛不住**：`com.luna.music` 的 ABI 是 `arm`（32 位），基线常驻 1.1 GB RSS。建索引要读 28 MB / 546 个缓存文件，解密一首无损要 40~60 MB —— 实测把它撑到 **RSS 1.4 GB**，它自己的图片管线直接 `OutOfMemoryError: decode out of memory` 崩掉，导出线程死在写盘中间，目录里留下 0 字节 `.pending-*` 文件。用户侧看到的就是「点了没反应 + 卡死」 |
+| **App 自己的浮窗 + 常驻前台服务**（重活挪回 App 进程） | 功能正常（浮窗覆盖在汽水上、不抢焦点），但**代价是常驻**：App 进程 + 一个 root 长驻 shell。用户明确否决 |
+| **LSPosed 在宿主启动时唤起 App 浮窗服务** | 这台机器上**根本通不了**：装了 HMA-OSS（Hide My Applist），它会在系统层把「宿主查我们包」判为 insecure query 直接过滤。`startForegroundService` 静默失败成 `Unable to start service ... not found`，而且**不抛异常**（所以 try/catch 兜底没用）。`am` 命令 rc=255（宿主 uid 无 shell 权限），隐式 Intent 被 Android 5.0+ 的「Service Intent must be explicit」拦死 |
 
-LSPosed 模式下想手动触发（宿主进程内执行，免 su）：
+**结论**：就用 App 本身。少一层常驻、少一个进程、少一堆坑。
 
-```bash
-adb shell am broadcast -a com.syh.luna.action.EXPORT
-# 只导指定的几首（md5 可从导出报告的 "md5" 字段取）
-adb shell am broadcast -a com.syh.luna.action.EXPORT --esa md5 1e34a4167f71a451c04039ffbd94f4f6,42eda28b98d9b72f1eecdf5e840d91a6
-```
+> 如果你哪天想要浮窗，代码还在 `attic/Overlay.java.floatwin` 与 `attic/FloatService.java.floatwin`
+> （移出源码树是为了不参与编译）。信号文件通路（LSPosed 写 `files/luna_export/float_ping`，
+> App 用 root 轮询）在 `git log` 里也能找到。
 
-> root 模式下 `su` 落在**应用自己的挂载命名空间**里，那里的 `/data/data` 是个空 stub
-> （root 被换成 erofs 模块视图）。代码会自动切到 `/proc/1/root/data/data/com.luna.music`，
-> 那才是真数据。这一步在 `Dirs.stage()` 里自动完成。
+### root 模式的取数
+
+`su` 落在**应用自己的挂载命名空间**里，那里的 `/data/data` 是个空 stub
+（root 被换成 erofs 模块视图）。代码会自动切到 `/proc/1/root/data/data/com.luna.music`，
+那才是真数据。这一步在 `Dirs.stage()` 里自动完成。
 
 ## 二、界面（Miuix / HyperOS 风格）
 
@@ -106,14 +101,14 @@ adb shell am broadcast -a com.syh.luna.action.EXPORT --esa md5 1e34a4167f71a451c
 
 ## 四、产物落点（设备实测）
 
-Android 11+ 对共享存储里的**非媒体文件**只允许放在 `Download/` 下，
-`MediaStore.Downloads` 会拒绝 `Music/` 前缀，所以：
-
 | 内容 | 位置 | 方式 |
 |---|---|---|
-| 音频 `.flac` / `.m4a` | `/sdcard/Music/汽水导出/` | MediaStore.Audio（进系统媒体库；同目录先删旧条目，重复导出不堆积） |
-| 歌词 `.lrc` | 同上，与歌曲同名并排 | 优先直写；不行才退到 `Download/汽水导出/` |
+| 音频 `.flac` / `.m4a` | `/sdcard/Music/汽水导出/` | MediaStore.Audio（进系统媒体库） |
+| 歌词 `.lrc` | **同上，与歌曲同名并排** | 直写文件系统；失败才退到 `Download/汽水导出/` |
 | `_导出报告.json` / `_导出日志.txt` | `/sdcard/Download/汽水导出/` | Downloads 集合，行为稳定可预期 |
+
+要让 `.lrc` 与歌曲同目录，需要授予**「所有文件访问」**（App 状态卡上点一下即可跳转）。
+没有它时 Android 11+ 只允许把非媒体文件放 `Download/` 下 —— 功能不受影响，只是歌词会换个位置。
 
 日志也可以随时从应用内「▸ 运行日志」面板查看；私有副本在
 `adb shell run-as com.syh.luna cat files/last_run.log`。
@@ -190,11 +185,16 @@ $JDK -cp luna-lsp/out/classes com.syh.luna.cli.Main --blobs _blobs.bin --out _ja
 | 后台线程读 `session` 字段，而它在 `runOnUiThread` 里赋值 | session 作为参数传入，别读字段 |
 | `MediaStore.Downloads` 拒绝 `Music/` 前缀 | 非媒体文件走 `Download/xxx`；音频走 `MediaStore.Audio` |
 | 重复导出堆积重复条目 | insert 前按 `DISPLAY_NAME + RELATIVE_PATH LIKE` 先删 |
+| **`.lrc` 落盘变成 `.lrc.txt`** | MIME 传了 `text/plain` → MediaStore 的 `ensureFileExtension` 按 MIME 的标准扩展名补 `.txt`。**改用 `application/octet-stream`**（无标准扩展名，原样保留） |
+| **重复导出出现 `xxx (1).flac`** | ① 删除语句用了 `Music/…` 前缀，而实际写进的是 `Download/…`，LIKE 匹配不上；② MediaStore 重名时会把旧条目改名成 `xxx (1)`，按原名删不掉。**改成用实际 relPath + 同时匹配 `name` 与 `name (%)`** |
+| 跨 uid 删不掉别人建的媒体条目 | 宿主建的条目，App 的 uid 删不了 —— 授予**「所有文件访问」**后才可以 |
 | `adb push <中文名> /dir/` 报 `Is a directory` | 显式给目标文件名 |
 | javac 把**注释里的 `\u`** 也当 unicode 转义 | 源码注释禁写 `\uXXXX` |
 | Java 的 `.` 默认不匹配 `\r \u0085 \u2028 \u2029`（Python 只排除 `\n`） | KRC 正则用 `[^\n]*` + `find()/start()==0` |
 | `String.format("%05.2f")` 是最短十进制+HALF_UP，CPython 是精确值 half-even | `new BigDecimal(double).setScale(2, HALF_EVEN)` |
 | 索引**必须走 SQLite** | 把 `.db` 当原始字节扫会掉到 74/371 |
+| **有密钥、能导出，但歌名显示成「未知曲目 · <md5>」** | 宿主的 `playableJson`（播放历史）里**嵌着被转义的 JSON**：`"...\"video_meta\":{\"file_hash\":\"2a42224df81e…\"}"`。`file_hash` 就是 `.mdl` 的文件名，但它在**字符串值内部**，原文扫不出来 → `md5→vid` 建不起来。**修法**：① `feed()` 里对含 `\"` 的文本把 `\"` 还原成 `"` 再扫一遍；② 新增 `file_hash` 采集，与**同一条记录**里的 track vid 关联（`linkHashes()`，只在恰好一个 vid 时才连，避免歌单连错）。效果：`md5映射 130 → 649`，「可导出但无标题」归零 |
+| 只读 sqlite 的 TEXT 列 | **BLOB 列也要扫**。宿主把整段 JSON 存 BLOB（`grep` 这些 `.db` 会报 `Binary file matches`），只读 TEXT 会漏掉最新鲜的元数据 |
 
 ## 九、GitHub 检索结论
 

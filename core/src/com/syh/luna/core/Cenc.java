@@ -182,7 +182,9 @@ public final class Cenc {
         }
         if (blkHdr.isEmpty()) throw new IllegalStateException("empty dfLa metadata");
 
-        ByteBuf out = new ByteBuf(1 << 20);
+        // 直接按输入大小预留：ByteBuf 是 1.5 倍增长，47 MB 的曲目在扩容瞬间
+        // 会同时持有「旧数组 + 新数组」（约 67 MB + 47 MB）。预留后全程只分配一次。
+        ByteBuf out = new ByteBuf(buf.length + 65536);
         out.put(Mp4.b4("fLaC"));
         for (int i = 0; i < blkHdr.size(); i++) {
             int h = (blkHdr.get(i)[0] & 0x7f) | (i == blkHdr.size() - 1 ? 0x80 : 0);
@@ -246,7 +248,8 @@ public final class Cenc {
 
         public void put(byte[] b) { ensure(b.length); System.arraycopy(b, 0, a, n, b.length); n += b.length; }
 
-        public byte[] toArray() { return Arrays.copyOf(a, n); }
+        /** 正好装满时直接交出底层数组，省掉一次整份拷贝（几十 MB 级别的差别） */
+        public byte[] toArray() { return n == a.length ? a : Arrays.copyOf(a, n); }
 
         public int size() { return n; }
     }

@@ -6,8 +6,8 @@ import android.content.Context;
 import android.util.Log;
 
 import com.syh.luna.android.BlobStore;
-import com.syh.luna.android.Exporter;
 import com.syh.luna.android.KeyVault;
+import com.syh.luna.android.Logx;
 
 import java.io.File;
 import java.util.HashMap;
@@ -21,28 +21,30 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * 汽水导出 · LSPosed 入口。
+ * 汽水导出 · LSPosed 入口（**只做被动抓取**）。
  *
  * 设计原则：**用户不主动点导出，绝不落盘任何歌曲。**
- * 所以这里没有「宿主启动自动导出」——那会让你只是正常听歌/浏览时也被导出，白占空间。
  *
- * 本模块只做三件事：
- *   1) 在汽水音乐**自己的界面里挂一个浮层入口**（悬浮球 + 展开卡片），
- *      点一下就地导出 —— 免 su、免切应用。见 {@link Overlay}
- *   2) 被动抓密钥：只读网络响应里出现的 encrypt_info.spade_a，写进几十 KB 的 keys.json
- *      —— 不产生任何歌曲文件
- *   3) 兜底：也响应显式广播，便于 adb / 自动化触发
- *      adb shell am broadcast -a com.syh.luna.action.EXPORT
- *      （可带 --esa md5 a,b,c 只导出指定的几首）
+ * 本模块在宿主进程里只做一件事：
+ *   被动抓密钥 —— 只读网络响应里出现的 encrypt_info.spade_a（连同曲目元数据），
+ *   写进几十 KB 的 keys.json / blobs.bin。**不产生任何歌曲文件，也不加任何界面。**
  *
- * 浮层的挂载点用 Application.registerActivityLifecycleCallbacks —— 不需要 hook 任何
- * 混淆类名，宿主改版也不受影响。（moonhook 走的是同一条路。）
+ * 它唯一的价值：汽水音乐只在「播放过 / 完整下载过」的歌上缓存 key；
+ * 被动把这些收下来，本地没缓存到的歌也能解开。
+ *
+ * 导出本身完全由「汽水导出」App 自己完成（root 模式读私有目录 → 离线解密）。
+ *
+ * 试过但已撤掉的方案（记在这里，免得以后重复踩）：
+ *   ✗ 宿主内浮窗 / 宿主内导出 —— 宿主是 32 位、常驻 1.1 GB，扛不住建索引与解密，
+ *     实测把它撑到 RSS 1.4 GB 后它的图片管线 OOM 崩掉，导出死在写盘中间
+ *   ✗ 宿主启动时唤起 App 的浮窗服务 —— 被 HMA-OSS 在系统层拦成
+ *     `Unable to start service ... not found`（而且 startService 不抛异常，静默失败）
+ *   ✗ 宿主启动自动导出 —— 用户明确要求：没主动点导出，绝不落盘
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     static final String TAG = "LunaExport";
     static final String PKG = "com.luna.music";
-    static final String ACTION_EXPORT = "com.syh.luna.action.EXPORT";
 
     static volatile boolean started = false;
     static volatile Context APP = null;
@@ -93,106 +95,26 @@ public class MainHook implements IXposedHookLoadPackage {
     static synchronized void onApp(Context ctx) {
         if (APP != null) return;
         APP = ctx;
+        // android 层统一走 Logx；在宿主进程里把它也接到 LSPosed 日志
+        Logx.extra = new Logx.Sink() {
+            public void log(String s) { MainHook.log(s); }
+        };
         VAULT = new File(new File(ctx.getDataDir(), KeyVault.DIR), KeyVault.FILE);
         BLOBS = BlobStore.file(ctx.getDataDir());
         log("宿主 Context 就绪: " + ctx.getPackageName() + "  vault=" + VAULT);
         log("元数据仓库: " + BLOBS + "（当前 " + BLOBS.length() + " 字节）");
-        installManualReceiver(ctx);
-        installOverlay(ctx);
-    }
-
-    // ------------------------------------------------------------------ 宿主内浮层
-    /**
-     * 用 ActivityLifecycleCallbacks 找出前台 Activity，往上挂我们的浮层。
-     *
-     * 为什么不用 hook Activity.onResume：
-     *   宿主 Activity 类名混淆过、且会改版；生命周期回调是 Application 的公开 API，
-     *   不碰宿主任何类，最稳。
-     */
-    private static void installOverlay(Context ctx) {
-        try {
-            if (!(ctx instanceof Application)) {
-                log("Context 不是 Application，浮层跳过");
-                return;
-            }
-            ((Application) ctx).registerActivityLifecycleCallbacks(
-                    new Application.ActivityLifecycleCallbacks() {
-                        public void onActivityCreated(android.app.Activity a, android.os.Bundle b) { }
-
-                        public void onActivityStarted(android.app.Activity a) { }
-
-                        public void onActivityResumed(android.app.Activity a) {
-                            Overlay.onActivityResumed(a);
-                        }
-
-                        public void onActivityPaused(android.app.Activity a) { }
-
-                        public void onActivityStopped(android.app.Activity a) { }
-
-                        public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) { }
-
-                        public void onActivityDestroyed(android.app.Activity a) {
-                            Overlay.onActivityDestroyed(a);
-                        }
-                    });
-            log("已注册前台浮层（ActivityLifecycleCallbacks）");
-        } catch (Throwable t) {
-            log("注册浮层失败: " + t);
-        }
-    }
-
-    /** 只有收到显式广播才导出；顺带可用 md5 白名单，只导指定的几首 */
-    private static void installManualReceiver(final Context ctx) {
-        try {
-            android.content.BroadcastReceiver r = new android.content.BroadcastReceiver() {
-                @Override
-                public void onReceive(final Context c, android.content.Intent it) {
-                    try {
-                        final String[] md5 = it == null ? null : it.getStringArrayExtra("md5");
-                        log("收到手动导出请求" + (md5 == null ? "（全部可导出）" : "（" + md5.length + " 首）"));
-                        Thread th = new Thread(new Runnable() {
-                            public void run() {
-                                try {
-                                    Exporter.Session s = Exporter.prepare(ctx, false, new Exporter.Log() {
-                                        public void line(String x) { log(x); }
-                                    }, null);
-                                    if (s.error != null) { log("✗ " + s.error); return; }
-                                    java.util.List<Exporter.Item> chosen = null;
-                                    if (md5 != null) {
-                                        java.util.Set<String> want =
-                                                new java.util.HashSet<String>(java.util.Arrays.asList(md5));
-                                        chosen = new java.util.ArrayList<Exporter.Item>();
-                                        for (Exporter.Item i : s.items)
-                                            if (want.contains(i.md5) && i.exportable()) chosen.add(i);
-                                    }
-                                    Exporter.Stats st = Exporter.export(s, chosen, new Exporter.Log() {
-                                        public void line(String x) { log(x); }
-                                    }, null, true);
-                                    log("手动导出完成: 请求 " + st.requested + " / 成功 " + st.ok
-                                            + " / 失败 " + st.failed);
-                                } catch (Throwable t) {
-                                    log("手动导出异常: " + t);
-                                }
-                            }
-                        }, "luna-manual-export");
-                        th.setDaemon(true);
-                        th.start();
-                    } catch (Throwable t) {
-                        log("onReceive: " + t);
-                    }
-                }
-            };
-            android.content.IntentFilter f = new android.content.IntentFilter(ACTION_EXPORT);
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                // 2 = Context.RECEIVER_EXPORTED（写常量值避免低版本运行时找不到符号）
-                ctx.registerReceiver(r, f, 2);
-            } else {
-                ctx.registerReceiver(r, f);
-            }
-            log("已注册手动导出广播接收器: " + ACTION_EXPORT);
-        } catch (Throwable t) {
-            log("注册广播失败: " + t);
-        }
+        // ==============================================================
+        // 宿主侧**只做这一件事**：被动抓密钥与曲目元数据（每次几十 KB）。
+        //
+        // 不做的事（都在 v1.0.1~v1.1.0 试过，已按用户要求撤掉）：
+        //   ✗ 不挂浮窗 —— 宿主是 32 位、常驻 1.1 GB，扛不住建索引/解密
+        //     （实测撑到 RSS 1.4 GB 后它的图片管线 OOM 崩掉，导出死在写盘中间）
+        //   ✗ 不注册「手动导出」广播 —— 同样跑在宿主进程里，会重演上面的崩溃
+        //   ✗ 不在宿主启动时唤起 App 的浮窗服务 —— 实测被 HMA-OSS 拦成 not found
+        //
+        // 现在就是纯 App：你自己打开「汽水导出」→ 扫描 → 勾选 → 导出。
+        // 这个 hook 的价值只有一条：让那些「没播放过、本地没缓存 key」的歌也能解开。
+        // ==============================================================
     }
 
     // ------------------------------------------------------------------ 抓密钥

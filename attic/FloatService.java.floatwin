@@ -1,0 +1,272 @@
+package com.syh.luna.app;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
+import android.provider.Settings;
+
+import com.syh.luna.android.Logx;
+import com.syh.luna.lsp.Overlay;
+
+/**
+ * 浮窗前台服务 —— **跑在「汽水导出」App 自己的进程里**。
+ *
+ * 为什么要单独起一个服务、而不是像 v1.0.0 那样挂在宿主进程里：
+ *   com.luna.music 的 ABI 是 `arm`（32 位），基线常驻就占 1.1 GB RSS。
+ *   我们在它进程里建索引（28 MB / 546 个缓存文件）+ 解密一首无损（40~60 MB），
+ *   实测把它撑到 RSS 1.4 GB，它自己的图片管线直接
+ *   `OutOfMemoryError: decode out of memory` 崩掉，导出线程死在写盘中间，
+ *   目录里留下 0 字节的 `.pending-*` 文件 —— 用户侧看到的就是「点了没反应 + 卡死」。
+ *
+ * 所以改成：**LSPosed 只负责「发现汽水音乐起来了」并唤起本服务**，
+ * 扫描/解密/写盘全部在 App 自己的进程里跑（独立堆、可 largeHeap），
+ * 浮窗用 TYPE_APPLICATION_OVERLAY 覆盖在汽水音乐之上。
+ *
+ * 触发方式（三种都支持）：
+ *   · LSPosed 在宿主启动时 startForegroundService（见 MainHook.wakeFloatService）
+ *   · App 里点「显示浮窗」
+ *   · adb shell am start-foreground-service -n com.syh.luna/.app.FloatService
+ */
+public class FloatService extends Service {
+
+    public static final String ACTION_SHOW = "com.syh.luna.action.SHOW_FLOAT";
+    public static final String ACTION_HIDE = "com.syh.luna.action.HIDE_FLOAT";
+    public static final String ACTION_TOGGLE = "com.syh.luna.action.TOGGLE_FLOAT";
+    /** 只启动常驻监听（等汽水音乐起来再显示浮窗），不立刻显示 */
+    public static final String ACTION_WATCH = "com.syh.luna.action.WATCH";
+
+    private static final String CHANNEL = "luna_float";
+    private static final int NID = 0x1001;
+
+    /** 宿主（汽水音乐）私有目录里的「启动信号」文件 —— LSPosed 侧写，我们读 */
+    private static final String PING = "files/luna_export/float_ping";
+
+    private Thread watcher;
+    private volatile boolean watchStop;
+
+    /** 悬浮窗权限是否已授予 */
+    public static boolean canOverlay(android.content.Context c) {
+        try {
+            if (Build.VERSION.SDK_INT >= 23) return Settings.canDrawOverlays(c);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 跳到系统的「显示在其他应用上层」授权页 */
+    public static void requestOverlay(android.content.Context c) {
+        try {
+            Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + c.getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            c.startActivity(i);
+        } catch (Throwable t) {
+            Logx.i("请求悬浮窗权限失败: " + t);
+        }
+    }
+
+    /** 幂等地把服务拉起来（App 内调用） */
+    public static void start(android.content.Context c, String action) {
+        try {
+            Intent i = new Intent(c, FloatService.class);
+            i.setAction(action == null ? ACTION_SHOW : action);
+            if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
+            else c.startService(i);
+        } catch (Throwable t) {
+            Logx.i("启动 FloatService 失败: " + t);
+        }
+    }
+
+    @Override
+    public IBinder onBind(Intent i) { return null; }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        ensureChannel();
+    }
+
+    @Override
+    public int onStartCommand(Intent it, int flags, int startId) {
+        String a = (it == null || it.getAction() == null) ? ACTION_SHOW : it.getAction();
+        try {
+            startForeground(NID, buildNotification());
+        } catch (Throwable t) {
+            Logx.i("startForeground 失败: " + t);
+        }
+
+        Logx.i("FloatService 收到 " + a);
+        if (ACTION_WATCH.equals(a)) {
+            startWatcher();
+            Logx.i("已进入常驻监听（不显示浮窗；汽水音乐启动时才出现）");
+            return START_STICKY;
+        }
+        if (ACTION_HIDE.equals(a)) {
+            // ⚠️ 只隐藏浮窗，**不停服务** —— 服务要继续常驻监听，
+            //    否则用户关一次浮窗后，下次打开汽水音乐就不会自动出现了。
+            Overlay.hide();
+            updateNotification("浮窗已隐藏 · 监听中", "汽水音乐一启动会自动出现；点这里打开完整界面");
+            Logx.i("浮窗已隐藏（常驻监听继续）");
+            return START_STICKY;
+        }
+        if (ACTION_TOGGLE.equals(a) && Overlay.isShown()) {
+            Overlay.hide();
+            updateNotification("浮窗已隐藏 · 监听中", "汽水音乐一启动会自动出现；点这里打开完整界面");
+            Logx.i("浮窗已隐藏（常驻监听继续）");
+            return START_STICKY;
+        }
+
+        if (!canOverlay(this)) {
+            Logx.i("没有悬浮窗权限，浮窗无法显示；已在通知里给出入口");
+            notifyNeedPermission();
+        } else {
+            Overlay.show(this);
+            Logx.i("浮窗请求已提交（Overlay.isShown=" + Overlay.isShown() + "）");
+        }
+        // 常驻监听：汽水音乐一起来就把浮窗唤起来。
+        // 为什么需要它 —— 这台机器装了 HMA-OSS，LSPosed 侧 startService 会被静默拦成
+        // `not found`（详见 MainHook.wakeFloatService 的注释），所以改走「写信号文件 + 我们轮询」。
+        startWatcher();
+        return START_STICKY;
+    }
+
+    // ------------------------------------------------------------------ 宿主启动监听
+
+    /**
+     * 用 root 起一个**常驻**的 shell，每 2 秒 stat 一次宿主私有目录里的信号文件。
+     *
+     * 为什么用长驻 shell 而不是每次 su：一次 su 要拉起一个进程（~100ms），
+     * 2 秒一次的话开销很可观；长驻 shell 只有一个进程，循环体只是一次 `[ -f ]`。
+     *
+     * 为什么需要 root：/data/user/0/com.luna.music 是 0700，我们的 uid 进不去。
+     * 没 root 也不影响手动使用（点「显示浮窗」即可），只是少了「自动跟随」。
+     */
+    private void startWatcher() {
+        if (watcher != null && watcher.isAlive()) return;
+        watchStop = false;
+        watcher = new Thread(new Runnable() {
+            public void run() {
+                // 两种前缀都试：有的 ROM 里 su 落在应用自己的挂载命名空间，
+                // 那里 /data/data 是空壳，真数据要用 init 的 root 去看。
+                String p1 = "/data/user/0/com.luna.music/" + PING;
+                String p2 = "/proc/1/root/data/user/0/com.luna.music/" + PING;
+                String script =
+                        "P1=" + p1 + "; P2=" + p2 + "; "
+                      + "while true; do "
+                      + "  for P in \"$P1\" \"$P2\"; do "
+                      + "    if [ -f \"$P\" ]; then rm -f \"$P\" 2>/dev/null; echo PING; break; fi; "
+                      + "  done; "
+                      + "  sleep 2; "
+                      + "done";
+                Process proc = null;
+                try {
+                    proc = new ProcessBuilder("su", "-c", script)
+                            .redirectErrorStream(true).start();
+                    Logx.i("浮窗监听已启动（等汽水音乐启动信号）");
+                    java.io.BufferedReader r = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(proc.getInputStream()));
+                    String line;
+                    while (!watchStop && (line = r.readLine()) != null) {
+                        if (line.indexOf("PING") >= 0) onHostStarted();
+                    }
+                } catch (Throwable t) {
+                    Logx.i("浮窗监听线程结束: " + t);
+                } finally {
+                    if (proc != null) proc.destroy();
+                    Logx.i("浮窗监听线程已退出");
+                }
+            }
+        }, "luna-watch");
+        watcher.setDaemon(true);
+        watcher.start();
+    }
+
+    private void onHostStarted() {
+        Logx.i("检测到汽水音乐启动 → 唤起浮窗");
+        if (!canOverlay(this)) { notifyNeedPermission(); return; }
+        Overlay.show(this);
+    }
+
+    // ------------------------------------------------------------------ 通知
+
+    private void ensureChannel() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null || nm.getNotificationChannel(CHANNEL) != null) return;
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL, "浮窗", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("汽水导出的浮窗开关");
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+        } catch (Throwable ignore) { }
+    }
+
+    private Notification buildNotification() {
+        return buildNotification("汽水导出 · 浮窗已开启",
+                "点这里打开完整界面；在通知里可随时隐藏浮窗");
+    }
+
+    private void updateNotification(String title, String text) {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(NID, buildNotification(title, text));
+        } catch (Throwable ignore) { }
+    }
+
+    private Notification buildNotification(String title, String text) {
+        Intent open = new Intent(this, MainActivity.class);
+        open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        int fl = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        PendingIntent pi = PendingIntent.getActivity(this, 1, open, fl);
+
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        b.setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentIntent(pi)
+                .setOngoing(true);
+
+        Intent hide = new Intent(this, FloatService.class).setAction(ACTION_HIDE);
+        PendingIntent hp = PendingIntent.getService(this, 2, hide, fl);
+        b.addAction(new Notification.Action.Builder(
+                android.R.drawable.ic_menu_close_clear_cancel, "隐藏浮窗", hp).build());
+        return b.build();
+    }
+
+    private void notifyNeedPermission() {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            int fl = PendingIntent.FLAG_UPDATE_CURRENT
+                    | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+            b.setContentTitle("还差一步：授予「显示在其他应用上层」")
+                    .setContentText("点这里去授权，之后浮窗就能覆盖在汽水音乐上了")
+                    .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                    .setContentIntent(PendingIntent.getActivity(this, 3, i, fl))
+                    .setAutoCancel(true);
+            nm.notify(NID + 1, b.build());
+        } catch (Throwable ignore) { }
+    }
+
+    private void stopForegroundCompat() {
+        try {
+            if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
+            else stopForeground(true);
+        } catch (Throwable ignore) { }
+    }
+}

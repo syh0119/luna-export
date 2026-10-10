@@ -127,7 +127,9 @@ public final class Pipeline {
             return info;
         }
 
-        byte[] b = raw.clone();
+        // raw 是刚从文件读出来的私有数组，没有任何人再引用它 —— 直接就地使用。
+        // （原来是 raw.clone()，在 32 位宿主里等于白占一整份文件大小的内存。）
+        byte[] b = raw;
         String kind = Cenc.classify(b);
         List<Cenc.Sample> table = Cenc.parseTrack(b);
         List<byte[]> ivs = Cenc.parseIvs(b);
@@ -217,9 +219,12 @@ public final class Pipeline {
             data = Cenc.decryptFlac(b, key, table, ivs, eff);
             ext = ".flac";
         } else {
-            data = Cenc.decryptAac(b.clone(), key, table, ivs, eff);
+            // decryptAac 是**原地**改 fourcc + 原地解样本，返回的就是传进去的数组；
+            // 原来这里传 b.clone()，等于白多一份拷贝
+            data = Cenc.decryptAac(b, key, table, ivs, eff);
             ext = ".m4a";
         }
+        b = null;                       // 让 GC 尽早回收输入缓冲（下面写标签时峰值会翻倍）
 
         // 只有完整曲目才写标签（残片的 moov 声明与真实数据不符）
         if (tag && complete) {

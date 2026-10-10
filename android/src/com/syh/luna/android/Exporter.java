@@ -42,6 +42,14 @@ public final class Exporter {
         public String sig = "";
         public String kind = "";
         public String title, artist, album;
+        /**
+         * 这个文件里 `tenc` 的 KID。
+         *
+         * 存它是为了让**缓存命中的路径也能重算 hasKey** —— 密钥库是会涨的
+         * （LSPosed 侧一直在被动抓 `encrypt_info`），而 KID 就写在文件里、不会变。
+         * 只存一个布尔值的话，第一次没 key 的歌会被永久钉死成「不可导出」。
+         */
+        public String kid;
         public boolean complete, hasKey, exported;
     }
 
@@ -64,6 +72,7 @@ public final class Exporter {
                     fr.title = Json.str(r, "title");
                     fr.artist = Json.str(r, "artist");
                     fr.album = Json.str(r, "album");
+                    fr.kid = Json.str(r, "kid");
                     fr.complete = "true".equals(String.valueOf(r.get("complete")));
                     fr.hasKey = "true".equals(String.valueOf(r.get("hasKey")));
                     fr.exported = "true".equals(String.valueOf(r.get("exported")));
@@ -87,6 +96,7 @@ public final class Exporter {
                 sb.append(",\"title\":").append(Json.escape(r.title));
                 sb.append(",\"artist\":").append(Json.escape(r.artist));
                 sb.append(",\"album\":").append(Json.escape(r.album));
+                sb.append(",\"kid\":").append(Json.escape(r.kid));
                 sb.append(",\"complete\":").append(r.complete);
                 sb.append(",\"hasKey\":").append(r.hasKey);
                 sb.append(",\"exported\":").append(r.exported).append("}");
@@ -104,6 +114,8 @@ public final class Exporter {
         public String title;
         public String artist;
         public String album;
+        /** 文件里 `tenc` 的 KID —— 用来在缓存命中的路径上重算 hasKey（见 FileRec.kid） */
+        public String kid;
         public boolean complete;
         public boolean hasKey;
         public boolean exported;      // 上次已成功导出
@@ -183,6 +195,14 @@ public final class Exporter {
         public long preparedMs;
         public int changedCount, newCount;
         public String error;
+        /**
+         * 是否额外输出侧车 `.lrc` 文件。
+         *
+         * **默认关**：歌词本来就已经写进音频标签了（FLAC 的 `LYRICS` / M4A 的 `©lyr`），
+         * 再丢一个同名 `.lrc` 在歌曲旁边只会让目录里多一倍文件。
+         * 只有播放器读不了内嵌标签时才需要打开。
+         */
+        public boolean wantLrc;
 
         public int countExportable() {
             int n = 0;
@@ -272,6 +292,7 @@ public final class Exporter {
 
         s.stateFile = stateFileFor(ctx, rootMode, s.root);
         s.state = State.load(s.stateFile);
+        s.wantLrc = lrcSidecar(ctx);        // 默认 false：歌词已内嵌，不额外丢 .lrc
 
         if (prog != null) prog.on(0, files.size(), "建立索引 …");
         Index idx = IndexBuilder.build(s.root, s.staged);
@@ -299,9 +320,35 @@ public final class Exporter {
                 it.artist = cached.artist;
                 it.album = cached.album;
                 it.complete = cached.complete;
-                it.hasKey = cached.hasKey;
                 it.exported = cached.exported;
                 it.changed = false;
+                // hasKey 用**当前索引**按 KID 重算，不信缓存里的布尔值。
+                // 密钥库是会长大的（LSPosed 侧一直在被动抓 encrypt_info），
+                // KID 又写在文件里不会变 —— 只存布尔值的话，第一次没 key 的歌
+                // 会被永久钉死成「不可导出」，密钥补上了也还是灰的。
+                it.kid = cached.kid;
+                if (it.kid != null && !it.kid.isEmpty()) {
+                    boolean now = idx.kid2spade.containsKey(it.kid);
+                    if (now != cached.hasKey) cached.hasKey = now;
+                    it.hasKey = now;
+                } else {
+                    it.hasKey = cached.hasKey;
+                }
+                // 上次没解析出标题的，从**索引**里再查一次（零读盘）。
+                // 索引是会变的：LSPosed 侧被动抓取一直在往 blobs.bin 里攒，
+                // 之前查不到的歌后来可能就有了 —— 否则空标题会被缓存永久固化。
+                if (it.title == null || it.title.isEmpty()) {
+                    Index.MetaHit mh = idx.fullMeta(md5, null);
+                    String t = Json.str(mh.meta, "title");
+                    if (t != null && !t.isEmpty()) {
+                        it.title = t;
+                        it.artist = Json.str(mh.meta, "artist");
+                        it.album = Json.str(mh.meta, "album");
+                        cached.title = it.title;
+                        cached.artist = it.artist;
+                        cached.album = it.album;
+                    }
+                }
             } else {
                 it.changed = true;
                 probed++;
@@ -313,10 +360,23 @@ public final class Exporter {
                     it.album = r.album;
                     it.complete = r.complete;
                     it.hasKey = isKey(r);
+                    it.kid = r.kid;
                 } catch (Throwable t) {
                     it.kind = "junk";
                 }
                 if (cached == null) s.newCount++;
+                // 把探测结果写回缓存 —— 否则下次扫描 sig 对不上还要重读一遍，
+                // 而且 kid / hasKey 永远存不下来（缓存路径就永远重算不了）
+                FileRec rec = s.state.files.get(md5);
+                if (rec == null) { rec = new FileRec(); s.state.files.put(md5, rec); }
+                rec.sig = sig;
+                rec.kind = it.kind;
+                rec.title = it.title;
+                rec.artist = it.artist;
+                rec.album = it.album;
+                rec.kid = it.kid;
+                rec.complete = it.complete;
+                rec.hasKey = it.hasKey;
             }
             s.items.add(it);
             i++;
@@ -358,6 +418,8 @@ public final class Exporter {
 
         s.sink = new MediaStoreSink(ctx, REL);
         s.preparedMs = System.currentTimeMillis() - t0;
+        // 扫描结果也落盘：kid / hasKey 这些只有写回去，下次缓存命中时才重算得出来
+        if (s.stateFile != null) s.state.save(s.stateFile);
         if (log != null) {
             log.line("索引: " + s.indexInfo
                     + (s.vaultKeys > 0 ? "（密钥仓补入 " + s.vaultKeys + "）" : ""));
@@ -471,9 +533,12 @@ public final class Exporter {
         int done = 0;
         for (Item it : chosen) {
             done++;
+            // 先报进度再干活 —— 否则第一首要跑完（读盘+解密+打标签+写库）才有一行日志，
+            // 用户会以为点了没反应
+            if (log != null) log.line("▶ " + done + "/" + chosen.size() + "  " + it.display());
             if (prog != null) prog.on(done, chosen.size(), it.display());
             try {
-                Pipeline.Result r = Pipeline.process(it.file, s.sink, s.idx, s.covers, false, true, true);
+                Pipeline.Result r = Pipeline.process(it.file, s.sink, s.idx, s.covers, false, true, s.wantLrc);
                 if (!first) report.append(",\n");
                 first = false;
                 report.append(r.toJson());
@@ -506,6 +571,9 @@ public final class Exporter {
             if (gentle) {
                 try { Thread.sleep(25); } catch (InterruptedException ignore) { }
             }
+            // 宿主是 32 位进程，一首无损曲目在「读入 + 解密 + 打标签」里的峰值是文件大小的
+            // 2~3 倍。每首之间主动回收一次，避免上一首的几十 MB 一直挂着把宿主推向 OOM。
+            System.gc();
         }
         report.append("\n]");
 
@@ -629,6 +697,26 @@ public final class Exporter {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * 是否额外输出侧车 `.lrc` 文件。**默认关** —— 歌词已经内嵌在音频标签里
+     * （FLAC `LYRICS` / M4A `©lyr`），再写一份同名 `.lrc` 只会让目录多一倍文件。
+     */
+    public static boolean lrcSidecar(Context ctx) {
+        try {
+            return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                    .getBoolean("lrc_sidecar", false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    public static void setLrcSidecar(Context ctx, boolean on) {
+        try {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                    .edit().putBoolean("lrc_sidecar", on).apply();
+        } catch (Throwable ignore) { }
     }
 
     public static void setAutoOnLaunch(Context ctx, boolean on) {

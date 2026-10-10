@@ -25,7 +25,7 @@ OUT="$ROOT/out/apk"
 MIN_SDK=29
 TGT_SDK=34
 VER_CODE=1
-VER_NAME=1.0.0
+VER_NAME=1.1.0
 
 echo "==================================================="
 echo " 构建 汽水导出 (LSPosed 模块 + 独立 App 二合一)  v$VER_NAME"

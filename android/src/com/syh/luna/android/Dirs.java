@@ -25,8 +25,9 @@ public final class Dirs {
     public static final String[] SUB = {
             "files/music",              // .mdl 本体
             "databases",                // sqlite：player/history/recent_played/download
-            "cache/NetCacheLoader",     // 接口原始 JSON blob
-            "files/keva",               // key-value 缓存
+            "cache/NetCacheLoader",     // 接口原始 JSON blob（cache 版）
+            "files/NetCacheLoader",     // 接口原始 JSON blob（files 版）—— 与上面是两套缓存，都要读
+            "files/keva",               // key-value 缓存（含 cached_queue / initial_record 等 .sgv）
             "files/luna_export",        // 本模块 hook 抓到的密钥仓
     };
 

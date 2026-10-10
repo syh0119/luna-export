@@ -272,8 +272,6 @@ public final class Tags {
             p += 4 + ln;
             if ((hdr & 0x80) != 0) break;
         }
-        byte[] frames = slice(flac, p, flac.length);
-
         List<byte[]> blocks = new ArrayList<byte[]>();
         List<Integer> types = new ArrayList<Integer>();
         for (int i = 0; i < meta.size(); i++) {
@@ -285,15 +283,29 @@ public final class Tags {
         if (cover != null && cover.length > 0) {
             types.add(6); blocks.add(flacPicture(cover));
         }
-        ByteArrayOutputStream out = new ByteArrayOutputStream(flac.length + 65536);
-        try {
-            out.write(new byte[]{'f', 'L', 'a', 'C'});
-            for (int i = 0; i < blocks.size(); i++) {
-                out.write(metaBlock(types.get(i), blocks.get(i), i == blocks.size() - 1));
-            }
-            out.write(frames);
-        } catch (Exception ignore) { }
-        return out.toByteArray();
+
+        // ⚠️ 这里原来是 slice(frames) + ByteArrayOutputStream + toByteArray()，
+        //    等于把几十 MB 的帧数据**拷了三遍**。宿主 com.luna.music 是 32 位进程、
+        //    基线已占 1.1 GB，一首 47 MB 的无损曲目光这一步就要 ~135 MB，
+        //    实测直接把宿主拖进 GC 死亡螺旋（卡死 78 秒、留下 0 字节 pending 文件）。
+        //    改成先算总长、一次性分配、直接 arraycopy —— 峰值从 3 份降到 1 份。
+        int head = 4;
+        for (int i = 0; i < blocks.size(); i++) head += 4 + blocks.get(i).length;
+        int framesLen = flac.length - p;
+        byte[] out = new byte[head + framesLen];
+        out[0] = 'f'; out[1] = 'L'; out[2] = 'a'; out[3] = 'C';
+        int w = 4;
+        for (int i = 0; i < blocks.size(); i++) {
+            byte[] d = blocks.get(i);
+            out[w++] = (byte) (((i == blocks.size() - 1) ? 0x80 : 0) | (types.get(i) & 0x7F));
+            out[w++] = (byte) ((d.length >> 16) & 0xFF);
+            out[w++] = (byte) ((d.length >> 8) & 0xFF);
+            out[w++] = (byte) (d.length & 0xFF);
+            System.arraycopy(d, 0, out, w, d.length);
+            w += d.length;
+        }
+        System.arraycopy(flac, p, out, w, framesLen);
+        return out;
     }
 
     // ================================================================ M4A

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LSPosed 读取该名字的 string-array 作为默认作用域 -->
+    <string-array name="xposed_scope">
+        <item>com.luna.music</item>
+    </string-array>
+</resources>

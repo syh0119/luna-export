@@ -1,0 +1,17 @@
+# 构建产物
+out/
+*.log
+
+# 签名中间产物（只要最终 APK）
+dist/*.idsig
+dist/*.apk.idsig
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 本机工具链绝对路径不该被共享（build-*.sh 里已用变量，若你改成本地路径请勿提交）
+local.properties

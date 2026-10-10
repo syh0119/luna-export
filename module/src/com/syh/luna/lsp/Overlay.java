@@ -1,0 +1,1063 @@
+package com.syh.luna.lsp;
+
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import com.syh.luna.android.Dirs;
+import com.syh.luna.android.Exporter;
+
+import java.io.File;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 宿主内浮层 —— 汽水音乐里直接点一下就能导出，**不用切到别的 App**。
+ *
+ * 为什么这比「独立 App」强：
+ *   代码本来就已经跑在 com.luna.music 进程里（LSPosed 注入），
+ *   所以直接 new 一层 View 挂到宿主窗口上就行 —— 免 su、免授权、免切应用。
+ *
+ * 挂在哪里：
+ *   首选 WindowManager + TYPE_APPLICATION_PANEL，token 取宿主 Activity 的窗口令牌。
+ *   panel 型窗口不参与宿主排版（不会把人家界面顶歪），也不需要 SYSTEM_ALERT_WINDOW 权限
+ *   —— 权限检查是按 uid 走的，宿主的 uid 未必有那个权限，所以绝不能用 TYPE_APPLICATION_OVERLAY。
+ *   万一 token 还没就绪 / ROM 拒绝，退化成直接往 DecorView 末尾 addView（同样无需权限）。
+ *
+ * 不做的事：
+ *   ✗ 不自动导出。只有用户点浮层上的按钮才动。
+ *   ✗ 不 hook 宿主任何业务方法（除了 MainHook 那处只读的抓密钥）。
+ */
+public final class Overlay {
+
+    // ------------------------------------------------------------------ Miuix 调色
+    private static final int ACCENT = 0xFF3482FF;
+
+    private static final int CARD_L = 0xFFFFFFFF, CARD_D = 0xFF1F1F1F;
+    private static final int FG_L = 0xFF1B1C1E, FG_D = 0xFFEDEDED;
+    private static final int SUB_L = 0xFF8A8F99, SUB_D = 0xFF9A9A9A;
+    private static final int FILL_L = 0xFFF1F2F4, FILL_D = 0xFF2C2C2C;
+    private static final int LINE_L = 0x14000000, LINE_D = 0x1FFFFFFF;
+    private static final int ON_ACCENT = 0xFFFFFFFF;
+
+    private static final int CARD_W = 300;     // dp
+    private static final int BALL = 48;        // dp
+    private static final int BALL_HIT = 52;    // dp，判「点击 vs 拖动」的位移阈值
+
+    // ------------------------------------------------------------------ 单例（全局只留一个浮层）
+    private static final Object LOCK = new Object();
+    private static Overlay INSTANCE;
+    private static Activity HOST_ACT;
+
+    /** 悬浮球位置（跨 Activity 记住） */
+    private static int sX = Integer.MIN_VALUE, sY = Integer.MIN_VALUE;
+    /** 展开卡片的位置 —— 与球分开记，展开后可以单独拖走 */
+    private static int cX = Integer.MIN_VALUE, cY = Integer.MIN_VALUE;
+    /** 悬浮球图标（从本模块自己的 APK assets 里读，宿主进程也能拿到） */
+    private static volatile Bitmap ICON;
+
+    private final Activity act;
+    private final Context ctx;
+    private final boolean dark;
+
+    private WindowManager wm;
+    private WindowManager.LayoutParams lp;
+    private FrameLayout.LayoutParams decorLp;      // 退化路径用
+    private boolean viaDecor;
+
+    private View root, ball, card;
+    private TextView stat1, stat2, prog, logText;
+    private TextView btnScan, btnSelect, btnExport, btnAll, btnOpen;
+    private android.widget.ScrollView listScroll;
+    private LinearLayout listBox;
+
+    private boolean expanded, busy;
+    private Exporter.Session session;
+    private final StringBuilder logBuf = new StringBuilder(4096);
+
+    private Overlay(Activity a) {
+        this.act = a;
+        this.ctx = a.getApplicationContext();
+        this.dark = isDark(a);
+    }
+
+    // ================================================================== 生命周期入口
+
+    /** 宿主某个 Activity 走到前台时调用；只对目标包生效，且全局只保留一个浮层 */
+    public static void onActivityResumed(Activity a) {
+        if (a == null) return;
+        try {
+            if (!Dirs.PKG.equals(a.getPackageName())) return;
+            synchronized (LOCK) {
+                if (HOST_ACT == a && INSTANCE != null) return;    // 已经挂在这个 Activity 上
+                if (INSTANCE != null) INSTANCE.detach();
+                Overlay o = new Overlay(a);
+                if (o.install()) { INSTANCE = o; HOST_ACT = a; }
+                else { INSTANCE = null; HOST_ACT = null; }
+            }
+        } catch (Throwable t) {
+            MainHook.log("Overlay.resumed: " + t);
+        }
+    }
+
+    public static void onActivityDestroyed(Activity a) {
+        synchronized (LOCK) {
+            if (HOST_ACT == a && INSTANCE != null) {
+                INSTANCE.detach();
+                INSTANCE = null;
+                HOST_ACT = null;
+            }
+        }
+    }
+
+    /** 仅供「汽水导出」App 自己预览界面用（带 --ez overlay true 启动） */
+    public static void preview(Activity a) {
+        synchronized (LOCK) {
+            if (INSTANCE != null) INSTANCE.detach();
+            Overlay o = new Overlay(a);
+            if (o.install()) { INSTANCE = o; HOST_ACT = a; }
+        }
+    }
+
+    // ================================================================== 挂载 / 摘除
+
+    private boolean install() {
+        try {
+            buildViews();
+            final View decor = act.getWindow().getDecorView();
+            // ⚠️ onActivityResumed 是在 handleResumeActivity 里调的，窗口此刻还没 addView，
+            //    所以 getWindowToken() 必然是 null —— 直接放弃会让我们永远只能退化到 DecorView。
+            //    这里 post 一拍（并按帧重试几次），等窗口真正 attach 再用 APPLICATION_PANEL。
+            final int[] tries = {0};
+            Runnable attach = new Runnable() {
+                public void run() {
+                    if (root == null) return;
+                    boolean ok = tryPanel();
+                    if (!ok && decor.getWindowToken() == null && tries[0] < 5) {
+                        tries[0]++;
+                        decor.postDelayed(this, 120);
+                        return;
+                    }
+                    if (!ok) ok = tryDecor();
+                    postLog(ok ? ("浮层已就位 · " + (viaDecor ? "DecorView 兜底" : "APPLICATION_PANEL"))
+                               : "浮层挂载失败（宿主窗口不可用）");
+                }
+            };
+            decor.postDelayed(attach, decor.getWindowToken() == null ? 120 : 0);
+            return true;
+        } catch (Throwable t) {
+            MainHook.log("Overlay.install 失败: " + t);
+            return false;
+        }
+    }
+
+    /** 首选：WindowManager + TYPE_APPLICATION_PANEL（不占宿主排版） */
+    private boolean tryPanel() {
+        try {
+            View decor = act.getWindow().getDecorView();
+            android.os.IBinder token = decor.getWindowToken();
+            if (token == null) {
+                MainHook.log("窗口令牌未就绪，走 DecorView 兜底");
+                return false;
+            }
+            WindowManager.LayoutParams p = baseParams();
+            p.type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
+            p.token = token;
+            WindowManager w = act.getWindowManager();
+            w.addView(root, p);
+            wm = w;
+            lp = p;
+            viaDecor = false;
+            return true;
+        } catch (Throwable t) {
+            MainHook.log("APPLICATION_PANEL 挂载失败(" + t + ")，退化 DecorView");
+            return false;
+        }
+    }
+
+    /** 兜底：直接挂到 DecorView 末尾（在宿主内容之上，同样无需权限） */
+    private boolean tryDecor() {
+        try {
+            View decor = act.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup)) return false;
+            FrameLayout.LayoutParams fp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            fp.gravity = Gravity.TOP | Gravity.START;
+            int[] xy = defaultPos();
+            fp.leftMargin = xy[0];
+            fp.topMargin = xy[1];
+            ((ViewGroup) decor).addView(root, fp);
+            decorLp = fp;
+            viaDecor = true;
+            wm = null;
+            lp = null;
+            return true;
+        } catch (Throwable t) {
+            MainHook.log("DecorView 兜底也失败: " + t);
+            return false;
+        }
+    }
+
+    void detach() {
+        try {
+            if (viaDecor) {
+                View decor = act.getWindow().getDecorView();
+                if (decor instanceof ViewGroup && root != null) ((ViewGroup) decor).removeView(root);
+            } else if (wm != null && root != null) {
+                wm.removeView(root);
+            }
+        } catch (Throwable ignore) { }
+        wm = null;
+        lp = null;
+        decorLp = null;
+        root = null;
+        ball = null;
+        card = null;
+    }
+
+    private WindowManager.LayoutParams baseParams() {
+        WindowManager.LayoutParams p = new WindowManager.LayoutParams();
+        p.format = PixelFormat.TRANSLUCENT;
+        p.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        p.width = WindowManager.LayoutParams.WRAP_CONTENT;
+        p.height = WindowManager.LayoutParams.WRAP_CONTENT;
+        p.gravity = Gravity.TOP | Gravity.START;
+        int[] xy = defaultPos();
+        p.x = xy[0];
+        p.y = xy[1];
+        p.setTitle("luna-export");
+        return p;
+    }
+
+    private int[] defaultPos() {
+        DisplayMetrics dm = act.getResources().getDisplayMetrics();
+        if (sX == Integer.MIN_VALUE) {
+            sX = Math.max(dp(8), dm.widthPixels - dp(BALL + 14));
+            sY = (int) (dm.heightPixels * 0.52f);
+        }
+        return new int[]{sX, sY};
+    }
+
+    // ================================================================== 视图
+
+    private void buildViews() {
+        root = new FrameLayout(act);
+        ball = buildBall();
+        card = buildCard();
+        card.setVisibility(View.GONE);
+        ((FrameLayout) root).addView(ball);
+        ((FrameLayout) root).addView(card);
+    }
+
+    // ---------------------------------------------------------------- 悬浮球
+    private View buildBall() {
+        View v;
+        Bitmap bm = icon();
+        if (bm != null) {
+            ImageView iv = new ImageView(act);
+            iv.setImageBitmap(bm);
+            iv.setScaleType(ImageView.ScaleType.FIT_XY);
+            iv.setAdjustViewBounds(false);
+            v = iv;
+        } else {
+            // 图标读不到时的兜底：蓝色圆 + 「导」
+            TextView t = new TextView(act);
+            t.setText("导");
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+            t.setTextColor(ON_ACCENT);
+            t.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            t.setGravity(Gravity.CENTER);
+            GradientDrawable d = new GradientDrawable();
+            d.setShape(GradientDrawable.OVAL);
+            d.setColor(ACCENT);
+            t.setBackground(d);
+            v = t;
+        }
+        int s = dp(BALL);
+        v.setLayoutParams(new FrameLayout.LayoutParams(s, s));
+        if (Build.VERSION.SDK_INT >= 21) v.setElevation(dp(8));
+        v.setAlpha(0.94f);
+        v.setOnTouchListener(makeDraggable(false));
+        return v;
+    }
+
+    // ---------------------------------------------------------------- 拖动
+    /**
+     * 通用拖动手感：位移 < 6dp 视为点击。
+     *
+     * @param asCard true = 拖的是展开卡片（更新 cX/cY）；false = 拖的是悬浮球（更新 sX/sY，且点击会展开）
+     *
+     * 挂在「球」和「卡片」两处 —— 卡片上除按钮外的空白（标题栏、状态文字、日志区）都能拖。
+     * 按钮是 clickable 子 View，会先吃掉事件，所以拖不到它们，互不干扰。
+     */
+    private View.OnTouchListener makeDraggable(final boolean asCard) {
+        return new View.OnTouchListener() {
+            float downX, downY;
+            int startX, startY;
+            boolean moved;
+
+            public boolean onTouch(View view, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        if (asCard) {
+                            startX = (cX == Integer.MIN_VALUE) ? sX : cX;
+                            startY = (cY == Integer.MIN_VALUE) ? sY : cY;
+                        } else {
+                            startX = sX;
+                            startY = sY;
+                        }
+                        moved = false;
+                        view.setAlpha(1f);
+                        return true;
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                        if (!moved && Math.hypot(dx, dy) < dp(6)) return true;
+                        moved = true;
+                        if (asCard) {
+                            cX = (int) (startX + dx);
+                            cY = (int) (startY + dy);
+                        } else {
+                            sX = (int) (startX + dx);
+                            sY = (int) (startY + dy);
+                        }
+                        applyPos(asCard);
+                        return true;
+                    }
+                    case MotionEvent.ACTION_UP:
+                        view.setAlpha(asCard ? 1f : 0.94f);
+                        if (!moved && !asCard) toggle(true);
+                        return true;
+                    case MotionEvent.ACTION_CANCEL:
+                        // 手势被别处抢走（宿主视图拦截等）——不是「点击」，绝不能当展开用
+                        view.setAlpha(asCard ? 1f : 0.94f);
+                        return true;
+                }
+                return false;
+            }
+        };
+    }
+
+    // ---------------------------------------------------------------- 展开卡片
+    private View buildCard() {
+        LinearLayout c = new LinearLayout(act);
+        c.setOrientation(LinearLayout.VERTICAL);
+        int w = dp(CARD_W);
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT);
+        c.setLayoutParams(flp);
+        c.setPadding(dp(14), dp(12), dp(14), dp(10));
+        c.setBackground(round(dark ? CARD_D : CARD_L, 16, dark ? LINE_D : LINE_L, 1));
+        if (Build.VERSION.SDK_INT >= 21) c.setElevation(dp(10));
+
+        // 标题行
+        LinearLayout head = new LinearLayout(act);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView dot = new TextView(act);
+        dot.setLayoutParams(new LinearLayout.LayoutParams(dp(8), dp(8)));
+        GradientDrawable dd = new GradientDrawable();
+        dd.setShape(GradientDrawable.OVAL);
+        dd.setColor(ACCENT);
+        dot.setBackground(dd);
+        TextView title = new TextView(act);
+        title.setText("汽水导出");
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        title.setTextColor(fg());
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tlp.leftMargin = dp(8);
+        title.setLayoutParams(tlp);
+        TextView close = new TextView(act);
+        close.setText("✕");
+        close.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        close.setTextColor(sub());
+        close.setPadding(dp(8), dp(2), dp(2), dp(2));
+        close.setClickable(true);
+        close.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { toggle(false); }
+        });
+        head.addView(dot);
+        head.addView(title);
+        head.addView(close);
+        // 「汽水导出」这一行就是拖动把手（✕ 是 clickable 子 View，会先吃掉事件，不会误拖）
+        head.setPadding(0, dp(4), 0, dp(4));
+        head.setOnTouchListener(makeDraggable(true));
+        c.addView(head);
+
+        c.addView(divider(dp(10), dp(8)));
+
+        stat1 = line(13, fg(), false);
+        stat2 = line(11.5f, sub(), false);
+        c.addView(stat1);
+        c.addView(stat2);
+
+        prog = line(11.5f, ACCENT, false);
+        prog.setVisibility(View.GONE);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        plp.topMargin = dp(6);
+        prog.setLayoutParams(plp);
+        c.addView(prog);
+
+        c.addView(divider(dp(10), dp(10)));
+
+        // 主操作行：[扫描曲目] [全选可导出]
+        LinearLayout row = new LinearLayout(act);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        btnScan = pill("扫描曲目", false);
+        btnScan.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { doScan(); }
+        });
+        btnSelect = pill("全选可导出", false);
+        btnSelect.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { toggleSelectAll(); }
+        });
+        LinearLayout.LayoutParams a = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        a.rightMargin = dp(8);
+        btnScan.setLayoutParams(a);
+        btnSelect.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(btnScan);
+        row.addView(btnSelect);
+        c.addView(row);
+
+        // 主按钮：导出选中的
+        btnExport = pill("导出选中", true);
+        btnExport.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { doExportSel(); }
+        });
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        elp.topMargin = dp(8);
+        btnExport.setLayoutParams(elp);
+        c.addView(btnExport);
+
+        // 次操作
+        LinearLayout row2 = new LinearLayout(act);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams r2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        r2.topMargin = dp(8);
+        row2.setLayoutParams(r2);
+        btnAll = link("导出全部");
+        btnAll.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { doExport(true); }
+        });
+        btnOpen = link("打开完整界面");
+        btnOpen.setGravity(Gravity.RIGHT);
+        btnOpen.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openApp(); }
+        });
+        btnAll.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        btnOpen.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row2.addView(btnAll);
+        row2.addView(btnOpen);
+        c.addView(row2);
+
+        // ---- 可选列表（扫描后出现；只列「可导出」的，避免 122 行长到离谱）
+        listScroll = new android.widget.ScrollView(act);
+        listScroll.setVerticalScrollBarEnabled(true);
+        listScroll.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET);
+        listBox = new LinearLayout(act);
+        listBox.setOrientation(LinearLayout.VERTICAL);
+        listScroll.addView(listBox, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        DisplayMetrics dm0 = act.getResources().getDisplayMetrics();
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (dm0.heightPixels * 0.34f));
+        slp.topMargin = dp(8);
+        listScroll.setLayoutParams(slp);
+        listScroll.setVisibility(View.GONE);
+        c.addView(listScroll);
+
+        c.addView(divider(dp(8), dp(4)));
+
+        logText = line(10.5f, sub(), true);
+        logText.setMaxLines(3);
+        logText.setLineSpacing(0f, 1.12f);
+        logText.setText("点「扫描曲目」读列表；拖标题栏可移动。只有你点按钮才会导出。");
+        c.addView(logText);
+
+        return c;
+    }
+
+    // ---------------------------------------------------------------- 可选列表
+    /** 线程安全入口：建 View 必须在主线程（扫描/导出都在后台线程里调它） */
+    private void rebuildList() {
+        if (act == null) return;
+        act.runOnUiThread(new Runnable() {
+            public void run() { rebuildListNow(); }
+        });
+    }
+
+    private void rebuildListNow() {
+        if (listBox == null) return;
+        listBox.removeAllViews();
+        Exporter.Session s = session;
+        if (s == null || s.error != null) { listScroll.setVisibility(View.GONE); return; }
+        int n = 0;
+        for (Exporter.Item it : s.items) {
+            if (!it.exportable()) continue;
+            listBox.addView(listRow(it));
+            n++;
+        }
+        listScroll.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
+        if (n == 0) postLog("没有可导出的曲目（残片/缺密钥/MV 不计）");
+        // 列表出现后卡片变高，重新夹一次位置，别让它掉出屏幕
+        if (card != null) {
+            card.post(new Runnable() {
+                public void run() { applyPos(true); }
+            });
+        }
+    }
+
+    private View listRow(final Exporter.Item it) {
+        LinearLayout r = new LinearLayout(act);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(2), dp(7), dp(2), dp(7));
+        r.setClickable(true);
+
+        final TextView ck = new TextView(act);
+        ck.setLayoutParams(new LinearLayout.LayoutParams(dp(19), dp(19)));
+        ck.setGravity(Gravity.CENTER);
+        ck.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        setCheck(ck, it.selected);
+
+        LinearLayout col = new LinearLayout(act);
+        col.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        clp.leftMargin = dp(10);
+        clp.rightMargin = dp(6);
+        col.setLayoutParams(clp);
+
+        TextView t = new TextView(act);
+        t.setText(it.display());
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        t.setTextColor(fg());
+        t.setSingleLine(true);
+        t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+
+        TextView sub = new TextView(act);
+        sub.setText(it.subtitle() + "   ·   " + it.state());
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        sub.setTextColor(sub());
+        sub.setSingleLine(true);
+        sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
+
+        col.addView(t);
+        col.addView(sub);
+
+        TextView badge = new TextView(act);
+        badge.setText(it.badge());
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        badge.setPadding(dp(7), dp(3), dp(7), dp(3));
+        badge.setTextColor(ACCENT);
+        badge.setBackground(round(dark ? FILL_D : FILL_L, 7, 0, 0));
+
+        r.addView(ck);
+        r.addView(col);
+        r.addView(badge);
+
+        r.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                it.selected = !it.selected;
+                setCheck((TextView) v.getTag(), it.selected);
+                refreshSel();
+            }
+        });
+        r.setTag(ck);
+        return r;
+    }
+
+    private void setCheck(TextView ck, boolean on) {
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.OVAL);
+        if (on) {
+            d.setColor(ACCENT);
+            ck.setText("✓");
+            ck.setTextColor(ON_ACCENT);
+        } else {
+            d.setColor(0x00000000);
+            d.setStroke(Math.max(1, dp(2)), dark ? 0x55FFFFFF : 0x33000000);
+            ck.setText("");
+        }
+        ck.setBackground(d);
+    }
+
+    private void toggleSelectAll() {
+        Exporter.Session s = session;
+        if (s == null || s.error != null) { postLog("先「扫描曲目」"); return; }
+        int total = 0, sel = 0;
+        for (Exporter.Item it : s.items) {
+            if (!it.exportable()) continue;
+            total++;
+            if (it.selected) sel++;
+        }
+        boolean want = sel < total;                 // 没全选就全选，已全选就清空
+        for (Exporter.Item it : s.items) if (it.exportable()) it.selected = want;
+        rebuildList();
+        refreshSel();
+    }
+
+    /** 刷新「导出选中 N 首」按钮与全选按钮文案 */
+    private void refreshSel() {
+        Exporter.Session s = session;
+        if (s == null || s.error != null) return;
+        final int n = s.selectedExportable().size();
+        final int total = s.countExportable();
+        act.runOnUiThread(new Runnable() {
+            public void run() {
+                if (btnExport != null) {
+                    btnExport.setText(n > 0 ? ("导出选中 " + n + " 首") : "导出选中");
+                    applyPill(btnExport, n > 0);
+                    btnExport.setAlpha(n > 0 ? 1f : 0.5f);
+                }
+                if (btnSelect != null) btnSelect.setText(n >= total && total > 0 ? "取消全选" : "全选可导出");
+            }
+        });
+    }
+
+    /** 导出当前勾选的曲目 */
+    private void doExportSel() {
+        Exporter.Session s = session;
+        if (s == null || s.error != null) { postLog("先「扫描曲目」"); return; }
+        List<Exporter.Item> chosen = s.selectedExportable();
+        if (chosen.isEmpty()) { postLog("没有勾选任何曲目（点「全选可导出」一键勾）"); return; }
+        runExport(chosen, "选中 " + chosen.size() + " 首");
+    }
+
+    // ---------------------------------------------------------------- 小组件
+    private TextView line(float sp, int color, boolean mono) {
+        TextView t = new TextView(act);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextColor(color);
+        if (mono) t.setTypeface(android.graphics.Typeface.MONOSPACE);
+        return t;
+    }
+
+    private View divider(int top, int bottom) {
+        View v = new View(act);
+        v.setBackgroundColor(dark ? LINE_D : LINE_L);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1) / 2 + 1));
+        p.topMargin = dp(top);
+        p.bottomMargin = dp(bottom);
+        v.setLayoutParams(p);
+        return v;
+    }
+
+    private TextView pill(String text, boolean primary) {
+        TextView t = new TextView(act);
+        t.setText(text);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        t.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(10), dp(9), dp(10), dp(9));
+        applyPill(t, primary);
+        return t;
+    }
+
+    private void applyPill(TextView t, boolean primary) {
+        if (primary) {
+            t.setTextColor(ON_ACCENT);
+            t.setBackground(round(ACCENT, 11, 0, 0));
+        } else {
+            t.setTextColor(ACCENT);
+            t.setBackground(round(dark ? FILL_D : FILL_L, 11, 0, 0));
+        }
+    }
+
+    private TextView link(String text) {
+        TextView t = new TextView(act);
+        t.setText(text);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        t.setTextColor(ACCENT);
+        t.setPadding(0, dp(4), 0, dp(4));
+        t.setClickable(true);
+        return t;
+    }
+
+    // ================================================================== 位置 / 展开
+
+    private void toggle(boolean open) {
+        if (root == null) return;
+        MainHook.log("浮层 " + (open ? "展开" : "收起"));
+        expanded = open;
+        ball.setVisibility(open ? View.GONE : View.VISIBLE);
+        card.setVisibility(open ? View.VISIBLE : View.GONE);
+        applyPos(open);
+        if (open) refreshStatus();
+    }
+
+    private void applyPos(boolean forCard) {
+        DisplayMetrics dm = act.getResources().getDisplayMetrics();
+        int x, y;
+        if (forCard) {
+            if (cX == Integer.MIN_VALUE) {
+                // 首次展开：贴着悬浮球往左推，视觉上像从球里长出来
+                cX = sX + dp(BALL) - dp(CARD_W);
+                cY = sY - dp(6);
+            }
+            int topMin = statusBarH() + dp(2);
+            int cardH = (card != null && card.getHeight() > 0) ? card.getHeight() : dp(260);
+            x = clamp(cX, dp(2), Math.max(dp(2), dm.widthPixels - dp(CARD_W + 2)));
+            y = clamp(cY, topMin, Math.max(topMin, dm.heightPixels - cardH - dp(8)));
+            cX = x;
+            cY = y;
+        } else {
+            x = clamp(sX, 0, Math.max(0, dm.widthPixels - dp(BALL)));
+            y = clamp(sY, 0, Math.max(0, dm.heightPixels - dp(BALL)));
+            sX = x;
+            sY = y;
+        }
+        if (viaDecor) {
+            if (decorLp == null) return;
+            decorLp.leftMargin = x;
+            decorLp.topMargin = y;
+            if (root != null) root.requestLayout();
+        } else {
+            if (lp == null || wm == null) return;
+            lp.x = x;
+            lp.y = y;
+            try { wm.updateViewLayout(root, lp); } catch (Throwable ignore) { }
+        }
+    }
+
+    // ================================================================== 动作
+
+    private void doScan() {
+        if (busy) { postLog("正在忙，稍等 …"); return; }
+        busy = true;
+        setProg("正在扫描 …");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    Exporter.Session s = Exporter.prepare(ctx, false, logger, progressor);
+                    if (s.error != null) {
+                        postLog("✗ " + s.error);
+                        setStat("扫描失败", s.error);
+                        return;
+                    }
+                    session = s;
+                    // 默认不预勾选 —— 由用户自己挑，或点「全选可导出」
+                    rebuildList();
+                    refreshStatus();
+                    postLog("扫描完成 · 可导出 " + s.countExportable() + " / 共 " + s.items.size()
+                            + " 个 .mdl（读盘 " + s.changedCount + "，其余走缓存）");
+                    // 逐条打印元数据 —— 用来定位「歌名解析不出来」到底断在哪一环
+                    int c = 0;
+                    for (Exporter.Item it : s.items) {
+                        if (!it.exportable()) continue;
+                        MainHook.log("META " + (++c) + " " + it.md5.substring(0, 8)
+                                + " | title=" + it.title + " | artist=" + it.artist
+                                + " | vid=" + s.idx.md5toVid.get(it.md5));
+                    }
+                } catch (Throwable t) {
+                    postLog("✗ 扫描异常: " + t);
+                } finally {
+                    busy = false;
+                    clearProg();
+                }
+            }
+        }, "luna-scan").start();
+    }
+
+    /**
+     * @param all true = 导出全部可导出；false = 只导出「新增/变更」（快）
+     */
+    /** @param all true = 全部可导出；false = 只导「新增/变更」 */
+    private void doExport(boolean all) {
+        Exporter.Session s = session;
+        if (s == null || s.error != null) { postLog("还没有列表，先「扫描曲目」"); doScan(); return; }
+        List<Exporter.Item> chosen = new ArrayList<Exporter.Item>();
+        if (all) {
+            for (Exporter.Item it : s.items) if (it.exportable()) chosen.add(it);
+        } else {
+            chosen.addAll(s.autoTargets());
+        }
+        if (chosen.isEmpty()) {
+            postLog(all ? "没有可导出的曲目" : "没有新增/变更的曲目（要全量请点「导出全部」）");
+            return;
+        }
+        runExport(chosen, (all ? "全部 " : "新增 ") + chosen.size() + " 首");
+    }
+
+    private void runExport(final List<Exporter.Item> chosen, final String label) {
+        if (busy) { postLog("正在忙，稍等 …"); return; }
+        busy = true;
+        setProg("导出 " + label + " …");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    Exporter.Stats st = Exporter.export(session, chosen, logger, progressor, false);
+                    postLog("✓ 完成: 成功 " + st.ok + " · 失败 " + st.failed
+                            + " · 带封面 " + st.withCover + " · " + (st.ms / 1000.0) + "s");
+                } catch (Throwable t) {
+                    postLog("✗ 导出异常: " + t);
+                } finally {
+                    busy = false;
+                    clearProg();
+                    rebuildList();      // 行内状态（已导出）要刷新
+                    refreshStatus();
+                }
+            }
+        }, "luna-export").start();
+    }
+
+    /**
+     * 打开「汽水导出」自己的界面（可勾选曲目）。
+     *
+     * ⚠️ 这条最容易失败：我们是从**宿主进程**去启动另一个应用（com.syh.luna），
+     *    Android 11+ 的包可见性 + 后台启动限制都可能把它拦掉。
+     *    所以做了三级兜底，并且把每一级的真实报错写进面板日志 —— 不给「点了没反应」。
+     */
+    private void openApp() {
+        final String pkg = "com.syh.luna";
+        final String cls = "com.syh.luna.app.MainActivity";
+
+        Intent i = new Intent(Intent.ACTION_MAIN);
+        i.setClassName(pkg, cls);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+        // ⚠️ 关键：startActivity 被拦时**不抛异常**，只静默返回 START_CANCELED(-92)。
+        //    所以必须先探测「我们的包对宿主是否可见」，否则永远走不进兜底分支。
+        //    实测这台机器上 HMA-OSS（Hide My Applist）会把跨应用查询判为 insecure 直接过滤。
+        boolean visible = false;
+        try {
+            visible = ctx.getPackageManager().resolveActivity(i, 0) != null;
+        } catch (Throwable ignore) { }
+
+        if (visible) {
+            try {
+                ctx.startActivity(i);
+                postLog("已请求打开完整界面");
+                return;
+            } catch (Throwable t) {
+                postLog("直接启动失败: " + t.getClass().getSimpleName() + " · " + t.getMessage());
+            }
+        } else {
+            postLog("包被隐私模块（HMA 等）过滤，改用 root 启动");
+        }
+
+        // 兜底：走 uid 0 —— am 不受包可见性过滤
+        try {
+            String out = Dirs.su("am start -n " + pkg + "/" + cls + " 2>&1; echo RC=$?");
+            if (out != null && out.indexOf("RC=0") >= 0) {
+                postLog("已通过 root 打开完整界面");
+                return;
+            }
+            postLog("root 启动失败: " + (out == null ? "su 不可用" : out.trim().replace('\n', '|')));
+        } catch (Throwable t) {
+            postLog("root 启动异常: " + t);
+        }
+
+        postLog("没打开成功。可直接用上面的列表勾选导出；"
+                + "或把 " + pkg + " 从 HMA/隐私模块的拦截名单放出来。");
+    }
+
+    // ================================================================== 悬浮球图标
+    /**
+     * 从**本模块自己的 APK** 里读 assets/luna-icon.png。
+     *
+     * 注意：代码虽然跑在宿主进程，但 Overlay 这个类是由 LSPosed 用**模块的 classloader**
+     * 加载的，所以 getResourceAsStream / getProtectionDomain 都指向我们自己的 APK，
+     * 不会拿到宿主的资源。
+     */
+    static Bitmap icon() {
+        if (ICON != null) return ICON;
+        synchronized (Overlay.class) {
+            if (ICON != null) return ICON;
+            try {
+                byte[] d = readOwnAsset("assets/luna-icon.png");
+                if (d != null && d.length > 0) {
+                    Bitmap bm = BitmapFactory.decodeByteArray(d, 0, d.length);
+                    if (bm != null) {
+                        ICON = bm;
+                        MainHook.log("悬浮球图标已加载 " + bm.getWidth() + "x" + bm.getHeight()
+                                + "（" + d.length + " 字节）");
+                    }
+                }
+                if (ICON == null) MainHook.log("悬浮球图标未取到，用蓝色圆兜底");
+            } catch (Throwable t) {
+                MainHook.log("加载悬浮球图标异常: " + t);
+            }
+            return ICON;
+        }
+    }
+
+    private static byte[] readOwnAsset(String name) {
+        // ① 自己的 classloader（LSPosed 把模块 APK 挂在 classpath 上）
+        for (String n : new String[]{"/" + name, name}) {
+            InputStream in = null;
+            try {
+                in = Overlay.class.getResourceAsStream(n);
+                if (in != null) return drain(in);
+            } catch (Throwable ignore) {
+            } finally {
+                if (in != null) { try { in.close(); } catch (Throwable ignore) { } }
+            }
+        }
+        // ② 直接从自己的 APK（code source 指向的那个 zip）里取
+        try {
+            java.security.CodeSource cs = Overlay.class.getProtectionDomain().getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                File apk = new File(cs.getLocation().toURI());
+                if (apk.isFile()) {
+                    java.util.zip.ZipFile z = new java.util.zip.ZipFile(apk);
+                    try {
+                        java.util.zip.ZipEntry e = z.getEntry(name);
+                        if (e != null) {
+                            InputStream in = z.getInputStream(e);
+                            try { return drain(in); } finally { in.close(); }
+                        }
+                    } finally {
+                        z.close();
+                    }
+                }
+            }
+        } catch (Throwable ignore) { }
+        return null;
+    }
+
+    private static byte[] drain(InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream(1 << 16);
+        byte[] buf = new byte[8192];
+        int r;
+        while ((r = in.read(buf)) > 0) o.write(buf, 0, r);
+        return o.toByteArray();
+    }
+
+    // ================================================================== 状态刷新
+
+    private void refreshStatus() {
+        if (stat1 == null) return;
+        Exporter.Session s = session;
+        if (s == null || s.error != null) {
+            setStat("尚未扫描", "点「扫描曲目」读取本地 .mdl 列表");
+            return;
+        }
+        int exp = s.countExportable();
+        // ⚠️ 这里要显示「索引里的密钥总数」，不是 vaultKeys（那只是本次从密钥仓补进来的条数）
+        setStat("可导出 " + exp + " 首 · 密钥 " + s.idx.kid2spade.size() + " 条"
+                        + (s.vaultKeys > 0 ? "（仓补 " + s.vaultKeys + "）" : ""),
+                "新增/变更 " + s.autoTargets().size() + " 首 · 共 " + s.items.size() + " 个文件");
+        if (btnAll != null) btnAll.setText("导出全部 " + exp + " 首");
+        refreshSel();          // 注意：这里**不**重建列表（列表重建很贵，只在扫描/导出后做）
+    }
+
+    private void setStat(final String a, final String b) {
+        act.runOnUiThread(new Runnable() {
+            public void run() {
+                if (stat1 != null) stat1.setText(a);
+                if (stat2 != null) stat2.setText(b);
+            }
+        });
+    }
+
+    private void setProg(final String s) {
+        act.runOnUiThread(new Runnable() {
+            public void run() {
+                if (prog != null) { prog.setText(s); prog.setVisibility(View.VISIBLE); }
+            }
+        });
+    }
+
+    private void clearProg() {
+        act.runOnUiThread(new Runnable() {
+            public void run() {
+                if (prog != null) prog.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    private void postLog(final String s) {
+        MainHook.log(s);
+        act.runOnUiThread(new Runnable() {
+            public void run() {
+                logBuf.append(s).append('\n');
+                if (logBuf.length() > 2000) logBuf.delete(0, logBuf.length() - 2000);
+                if (logText != null) logText.setText(logBuf.toString().trim());
+                refreshStatus();
+            }
+        });
+    }
+
+    private final Exporter.Log logger = new Exporter.Log() {
+        public void line(String s) { postLog(s); }
+    };
+
+    private final Exporter.Progress progressor = new Exporter.Progress() {
+        public void on(int done, int total, String label) {
+            setProg(total > 0 ? (done + "/" + total + "  " + label) : label);
+        }
+    };
+
+    // ================================================================== 工具
+
+    /** 状态栏高度 —— 卡片贴顶时不能钻到状态栏底下（窗口带 LAYOUT_IN_SCREEN） */
+    private int statusBarH() {
+        try {
+            int id = act.getResources().getIdentifier("status_bar_height", "dimen", "android");
+            if (id > 0) {
+                int h = act.getResources().getDimensionPixelSize(id);
+                if (h > 0) return h;
+            }
+        } catch (Throwable ignore) { }
+        return dp(28);
+    }
+
+    private int fg() { return dark ? FG_D : FG_L; }
+
+    private int sub() { return dark ? SUB_D : SUB_L; }
+
+    private int dp(int v) { return dp(act, v); }
+
+    private static int dp(Context c, int v) {
+        return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    private static boolean isDark(Activity a) {
+        try {
+            return (a.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                    == Configuration.UI_MODE_NIGHT_YES;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private GradientDrawable round(int fill, int radiusDp, int stroke, int strokeDp) {
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setColor(fill);
+        d.setCornerRadius(dp(radiusDp));
+        if (stroke != 0) d.setStroke(Math.max(1, dp(strokeDp)), stroke);
+        return d;
+    }
+}

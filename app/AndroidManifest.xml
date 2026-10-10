@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  一个 APK 两种用法：
+    · LSPosed 模块 —— xposedmodule / xposeddescription / xposedscope + assets/xposed_init
+    · 普通应用     —— launcher Activity，用 su 读宿主私有目录
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.syh.luna"
+    android:versionCode="1"
+    android:versionName="1.0.0">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="汽水导出"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <activity
+            android:name=".app.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="汽水导出">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ===== LSPosed 模块声明 ===== -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="汽水音乐导出：在宿主进程内直接读取 /data/data/com.luna.music 的 .mdl，离线解密 CENC(AES-128-CTR) 为无损 FLAC / M4A，写入 标题·歌手·专辑·歌词·封面 后输出到 Music/汽水导出/；并 hook 响应体被动补齐加密密钥。同一 APK 也可作为普通应用（root 模式）使用。" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+    </application>
+
+</manifest>

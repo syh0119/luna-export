@@ -1,0 +1,7 @@
+*.sh text eol=lf
+*.java text
+*.md text
+*.xml text
+*.png binary
+*.jar binary
+*.apk binary

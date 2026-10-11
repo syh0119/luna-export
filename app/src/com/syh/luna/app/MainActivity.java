@@ -59,6 +59,8 @@ public class MainActivity extends Activity {
 
     private TextView chipTotal, chipReady, chipPicked, chipFilter, statMain, statSub, autoSub;
     private TextView logView, progressText, emptyHint;
+    private android.widget.EditText search;
+    private String query = "";
     private ProgressBar bar;
     private View logBox, exportBtn;
     private ListView list;
@@ -161,6 +163,7 @@ public class MainActivity extends Activity {
         body.addView(settingsCard());
         body.addView(chips());
         body.addView(actions());
+        body.addView(searchBox());
         body.addView(listCard());
         body.addView(progressArea());
         body.addView(exportButton());
@@ -173,37 +176,38 @@ public class MainActivity extends Activity {
     private View header() {
         LinearLayout h = new LinearLayout(this);
         h.setOrientation(LinearLayout.VERTICAL);
-        h.setPadding(dp(20), dp(18), dp(20), dp(14));
+        h.setPadding(dp(20), dp(10), dp(20), dp(6));
 
         TextView t = new TextView(this);
         t.setText("汽水导出");
         t.setTextColor(TEXT);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setLetterSpacing(-0.02f);
         h.addView(t);
 
         TextView s = new TextView(this);
-        s.setText(".mdl 离线解密 · 无损 FLAC / M4A · 歌词与封面");
+        s.setText(".mdl 离线解密 · 无损 FLAC / M4A · 歌词封面内嵌");
         s.setTextColor(SUB);
-        s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        s.setPadding(0, dp(5), 0, 0);
+        s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        s.setPadding(0, dp(2), 0, 0);
         h.addView(s);
         return h;
     }
 
     private View statusCard() {
-        LinearLayout c = card();
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setPadding(dp(22), dp(2), dp(22), dp(8));
         statMain = new TextView(this);
         statMain.setTextColor(TEXT);
-        statMain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        statMain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         statMain.setText("检测 root 状态 …");
         c.addView(statMain);
 
         statSub = new TextView(this);
         statSub.setTextColor(SUB);
-        statSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        statSub.setPadding(0, dp(4), 0, 0);
+        statSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         statSub.setText("输出目录 /sdcard/" + Exporter.REL + "/");
         c.addView(statSub);
 
@@ -222,7 +226,7 @@ public class MainActivity extends Activity {
     private View chips() {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
-        r.setPadding(dp(2), dp(12), dp(2), dp(10));
+        r.setPadding(dp(2), dp(6), dp(2), dp(6));
         chipTotal = chip(r, "可操作 0/0", SUB, FILL);
         chipReady = chip(r, "可导出 0", OK, OKBG);
         chipPicked = chip(r, "已选 0", ACCENT, alphaOf(ACCENT, 0.14f));
@@ -240,10 +244,10 @@ public class MainActivity extends Activity {
     private TextView chip(LinearLayout p, String text, int fg, int bg) {
         TextView t = new TextView(this);
         t.setText(text);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         t.setTextColor(fg);
         t.setTypeface(Typeface.DEFAULT_BOLD);
-        t.setPadding(dp(12), dp(5), dp(12), dp(5));
+        t.setPadding(dp(10), dp(4), dp(10), dp(4));
         t.setBackground(round(bg, 100));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -256,10 +260,31 @@ public class MainActivity extends Activity {
     /** Miuix 开关行：启动时自动增量导出 */
     private View settingsCard() {
         LinearLayout c = card();
-        c.setPadding(dp(16), dp(6), dp(10), dp(6));
+        c.setPadding(dp(16), dp(9), dp(16), dp(9));
+
+        final TextView toggle = new TextView(this);
+        toggle.setText("▸ 设置 · 自动导出 / 歌词文件");
+        toggle.setTextColor(SUB);
+        toggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        toggle.setClickable(true);
+        c.addView(toggle);
+
+        final LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setVisibility(View.GONE);
+        box.setPadding(0, dp(6), dp(-6), 0);
+        c.addView(box);
+
+        toggle.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean open = box.getVisibility() == View.GONE;
+                box.setVisibility(open ? View.VISIBLE : View.GONE);
+                toggle.setText((open ? "▾" : "▸") + " 设置 · 自动导出 / 歌词文件");
+            }
+        });
 
         // ① 启动时自动增量导出
-        c.addView(settingRow("启动时自动增量导出", autoSub = new TextView(this),
+        box.addView(settingRow("启动时自动增量导出", autoSub = new TextView(this),
                 Exporter.autoOnLaunch(this),
                 new android.widget.CompoundButton.OnCheckedChangeListener() {
                     public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
@@ -280,7 +305,7 @@ public class MainActivity extends Activity {
         TextView lrcSub = new TextView(this);
         lrcSub.setText("歌词已内嵌在音频里（FLAC 的 LYRICS / M4A 的 ©lyr），"
                 + "正常播放器都能读到，通常不需要再要 .lrc 文件");
-        c.addView(settingRow("额外输出 .lrc 歌词文件", lrcSub, Exporter.lrcSidecar(this),
+        box.addView(settingRow("额外输出 .lrc 歌词文件", lrcSub, Exporter.lrcSidecar(this),
                 new android.widget.CompoundButton.OnCheckedChangeListener() {
                     public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
                         Exporter.setLrcSidecar(MainActivity.this, v);
@@ -352,7 +377,7 @@ public class MainActivity extends Activity {
     private View actions() {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
-        r.setPadding(0, 0, 0, dp(12));
+        r.setPadding(0, 0, 0, dp(8));
 
         TextView scan = pill("扫描曲目", ACCENT, WHITE, true);
         scan.setOnClickListener(new View.OnClickListener() {
@@ -388,6 +413,56 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, w);
         lp.rightMargin = dp(8);
         return lp;
+    }
+
+    /** 搜索框：按曲名 / 歌手即时过滤下面的列表 */
+    private View searchBox() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.HORIZONTAL);
+        c.setGravity(Gravity.CENTER_VERTICAL);
+        c.setBackground(round(FILL, 100));
+        c.setPadding(dp(14), 0, dp(10), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(38));
+        lp.bottomMargin = dp(8);
+        c.setLayoutParams(lp);
+
+        TextView icon = new TextView(this);
+        icon.setText("🔍");
+        icon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        c.addView(icon);
+
+        search = new android.widget.EditText(this);
+        search.setHint("搜索曲名 / 歌手");
+        search.setHintTextColor(SUB);
+        search.setTextColor(TEXT);
+        search.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        search.setSingleLine(true);
+        search.setBackground(null);
+        search.setPadding(dp(8), 0, dp(4), 0);
+        search.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+                query = s == null ? "" : s.toString().trim().toLowerCase();
+                applyFilter();
+                refreshChips();
+            }
+            public void afterTextChanged(android.text.Editable s) { }
+        });
+        c.addView(search, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        final TextView clear = new TextView(this);
+        clear.setText("✕");
+        clear.setTextColor(SUB);
+        clear.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        clear.setPadding(dp(8), dp(4), dp(2), dp(4));
+        clear.setClickable(true);
+        clear.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { search.setText(""); }
+        });
+        c.addView(clear);
+        return c;
     }
 
     private View listCard() {
@@ -466,8 +541,8 @@ public class MainActivity extends Activity {
 
     private View exportButton() {
         TextView t = pill("导出选中", alphaOf(ACCENT, 0.45f), WHITE, true);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        t.setPadding(0, dp(14), 0, dp(14));
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setPadding(0, dp(11), 0, dp(11));
         t.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 if (busy) { append("任务进行中，请稍候 …"); return; }
@@ -477,7 +552,7 @@ public class MainActivity extends Activity {
         exportBtn = t;
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(12);
+        lp.topMargin = dp(8);
         lp.bottomMargin = dp(4);
         t.setLayoutParams(lp);
         return t;
@@ -492,7 +567,7 @@ public class MainActivity extends Activity {
         toggle.setText("▸ 运行日志");
         toggle.setTextColor(SUB);
         toggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        toggle.setPadding(dp(4), dp(8), dp(4), dp(8));
+        toggle.setPadding(dp(4), dp(5), dp(4), dp(5));
         toggle.setClickable(true);
 
         logBox = wrapLog();
@@ -778,7 +853,12 @@ public class MainActivity extends Activity {
         if (session == null) return;
         rows.clear();
         for (Exporter.Item it : session.items) {
-            if (showAll || it.exportable() || it.exported) rows.add(it);
+            if (!(showAll || it.exportable() || it.exported)) continue;
+            if (query.length() > 0) {
+                String hay = (it.display() + " " + it.subtitle()).toLowerCase();
+                if (!hay.contains(query)) continue;
+            }
+            rows.add(it);
         }
         if (adapter != null) adapter.notifyDataSetChanged();
         boolean empty = rows.isEmpty();

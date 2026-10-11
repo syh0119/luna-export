@@ -1,0 +1,12 @@
+{
+ "main": "luna_pc_app.js",
+ "output": "sea-prep.blob",
+ "disableExperimentalSEAWarning": true,
+ "useSnapshot": false,
+ "useCodeCache": false,
+ "assets": {
+  "bdms.node": "native/bdms.node",
+  "device.node": "native/device.node",
+  "metasecml.dll": "native/metasecml.dll"
+ }
+}

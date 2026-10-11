@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>汽水导出</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%233482FF'/%3E%3Cpath d='M27 45a7 7 0 1 1-5-6.7V19l22-4.4v23.1a7 7 0 1 1-5-6.7V21.5l-14 2.8V45z' fill='white'/%3E%3C/svg%3E">
+<style>
+:root { --blue:#3482FF; --bg:#F7F8FA; --card:#fff; --txt:#111; --sub:#8A8E99; --ok:#34B36E; --warn:#E8A23D; --err:#E64545; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--txt); height:100vh; overflow:hidden; }
+.wrap { max-width:720px; margin:0 auto; padding:16px 16px 78px; height:100vh; display:flex; flex-direction:column; min-height:0; }
+.view { flex:1; min-height:0; display:flex; flex-direction:column; gap:12px; }
+.view > .card { margin-bottom:0; }
+.card.fixed { flex:none; }
+.card.grow { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.scroll { flex:1; min-height:0; overflow-y:auto; }
+.stickyhead { position:sticky; top:0; background:var(--card); z-index:2; border-bottom:1px solid #F2F3F5; }
+h1 { font-size:22px; padding:10px 4px 14px; }
+.tabs { display:flex; gap:8px; margin-bottom:12px; }
+.tabs button { flex:1; padding:9px 0; border:none; border-radius:12px; background:var(--card); font-size:14px; color:var(--sub); cursor:pointer; }
+.tabs button.on { background:var(--blue); color:#fff; font-weight:600; }
+.card { background:var(--card); border-radius:16px; padding:12px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.04); }
+input[type=text] { width:100%; padding:10px 12px; border:1px solid #E5E7EB; border-radius:10px; font-size:14px; outline:none; }
+input[type=text]:focus { border-color:var(--blue); }
+.row { display:flex; align-items:center; gap:10px; padding:10px 4px; border-bottom:1px solid #F2F3F5; cursor:pointer; }
+.row:last-child { border-bottom:none; }
+.row:hover { background:#FAFBFF; }
+.row .meta { flex:1; min-width:0; }
+.row .t { font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.row .a { font-size:12px; color:var(--sub); }
+.row .q { font-size:11px; color:var(--sub); background:#F2F3F5; border-radius:6px; padding:2px 7px; }
+.cb { width:19px; height:19px; accent-color:var(--blue); flex-shrink:0; }
+.plrow { display:flex; align-items:center; gap:10px; padding:11px 4px; border-bottom:1px solid #F2F3F5; cursor:pointer; }
+.plrow:hover { background:#FAFBFF; }
+.bar { position:fixed; bottom:0; left:0; right:0; background:var(--card); box-shadow:0 -2px 10px rgba(0,0,0,.06); padding:12px 16px; display:flex; align-items:center; gap:12px; }
+.bar .cnt { flex:1; font-size:14px; }
+.bar select { padding:7px 10px; border:1px solid #E5E7EB; border-radius:10px; font-size:13px; }
+.bar button { background:var(--blue); color:#fff; border:none; border-radius:12px; padding:10px 22px; font-size:14px; font-weight:600; cursor:pointer; }
+.bar button:disabled { opacity:.5; }
+.item { display:flex; align-items:center; gap:10px; padding:7px 4px; font-size:13px; border-bottom:1px solid #F2F3F5; }
+.item .st { font-size:11px; padding:2px 8px; border-radius:6px; background:#F2F3F5; color:var(--sub); white-space:nowrap; }
+.item .st.done { background:#E8F7EF; color:var(--ok); }
+.item .st.err { background:#FDECEC; color:var(--err); }
+.item .st.dl { background:#EAF1FF; color:var(--blue); }
+#log { max-height:150px; overflow:auto; font:11px/1.7 Consolas,monospace; color:var(--sub); white-space:pre-wrap; word-break:break-all; }
+.tip { color:var(--sub); font-size:12px; padding:8px 4px; }
+.empty { text-align:center; color:var(--sub); padding:30px 0; font-size:13px; }
+a.dirlink { color:var(--blue); font-size:12px; cursor:pointer; text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>汽水导出 <span style="font-size:12px;color:var(--sub)">PC · 无损直出</span> <a class="dirlink" onclick="fetch('/api/open_dir')">打开目录 ↗</a> · <a class="dirlink" onclick="fetch('/api/proxy?on=1').then(()=>alert('系统代理已开启：客户端播放的歌会自动出现在「探测曲目」'))">开探测</a> · <a class="dirlink" onclick="fetch('/api/proxy?on=0').then(()=>alert('系统代理已关闭'))">关探测</a> · <a class="dirlink" onclick="quitApp()">退出</a></h1>
+  <div id="devbar" style="font-size:12px;color:var(--sub);padding:0 0 10px 2px;line-height:1.7">设备身份加载中…</div>
+  <div class="tabs">
+    <button id="tabSearch" class="on" onclick="switchTab('search')">搜索</button>
+    <button id="tabPl" onclick="switchTab('pl')">探测曲目</button>
+    <button id="tabTask" onclick="switchTab('task')">任务 <span id="taskBadge"></span></button>
+  </div>
+
+  <div id="viewSearch" class="view">
+    <div class="card fixed"><input id="q" type="text" placeholder="搜索歌名 / 歌手（实时联想，勾选后导出）" oninput="onType()"></div>
+    <div class="card grow">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex:none">
+        <b style="font-size:13px">搜索结果</b>
+        <button style="margin-left:auto;border:none;background:#F2F3F5;color:var(--txt);border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer" onclick="selectAllSug()">全选歌曲</button>
+      </div>
+      <div id="sugList" class="scroll"><div class="empty">输入关键词搜索</div></div>
+    </div>
+    <div class="card fixed">
+      <a class="dirlink" id="pasteToggle" onclick="togglePaste()">▸ 批量粘贴 track_id</a>
+      <div id="pasteBox" style="display:none;margin-top:8px">
+        <div class="tip">每行一个 track_id，或分享文案（自动提取数字）：</div>
+        <textarea id="pasteIds" rows="4" style="width:100%;padding:10px;border:1px solid #E5E7EB;border-radius:10px;font-size:13px;outline:none" placeholder="7655367581428549633&#10;6917878175166908418 …"></textarea>
+        <button style="margin-top:8px;border:none;background:var(--blue);color:#fff;border-radius:10px;padding:8px 18px;font-size:13px;cursor:pointer" onclick="addPasted()">加入下载队列</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="viewPl" class="view" style="display:none">
+    <div class="card fixed"><div class="tip">在汽水音乐客户端里<b>播放 / 搜索</b>歌曲（需开着「探测」），这里会自动出现记录，勾选导出。</div></div>
+    <div class="card grow">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex:none">
+        <b style="font-size:13px">探测到的曲目</b>
+        <button style="margin-left:auto;border:none;background:var(--blue);color:#fff;border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer" onclick="loadTracks()">刷新</button>
+        <button style="border:none;background:#F2F3F5;color:var(--txt);border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer" onclick="selectAllTracks()">全选</button>
+      </div>
+      <div id="trackList" class="scroll"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+
+  <div id="viewTask" class="view" style="display:none">
+    <div class="card grow scroll" id="taskList"><div class="empty">暂无任务</div></div>
+    <div class="card fixed"><div id="log">—</div></div>
+  </div>
+</div>
+
+<div class="bar">
+  <span class="cnt">已选 <b id="selN">0</b> 首</span>
+  <select id="quality">
+    <option value="lossless">无损</option>
+    <option value="hi_res">Hi-Res</option>
+    <option value="spatial">全景声</option>
+    <option value="highest">极高</option>
+    <option value="higher">较高</option>
+  </select>
+  <button id="btnGo" onclick="doDownload()" disabled>导出选中</button>
+</div>
+
+<script>
+let mode = 'search';
+const selected = new Set();
+let plTracks = [];
+
+function switchTab(m) {
+  mode = m;
+  for (const t of ['search', 'pl', 'task']) {
+    document.getElementById('view' + t.charAt(0).toUpperCase() + t.slice(1)).style.display = t === m ? '' : 'none';
+    document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('on', t === m);
+  }
+  if (m === 'pl') loadTracks();
+  if (m === 'task') refresh();
+}
+
+// ---------- 搜索（GET /luna/pc/sug） ----------
+let sugTimer = 0, sugRows = [];
+function togglePaste() {
+  const b = document.getElementById('pasteBox');
+  const open = b.style.display === 'none';
+  b.style.display = open ? '' : 'none';
+  document.getElementById('pasteToggle').textContent = (open ? '▾' : '▸') + ' 批量粘贴 track_id';
+}
+function onType() {
+  clearTimeout(sugTimer);
+  sugTimer = setTimeout(doSug, 350);
+}
+async function doSug() {
+  const q = document.getElementById('q').value.trim();
+  const el = document.getElementById('sugList');
+  if (!q) { el.innerHTML = '<div class="empty">输入关键词搜索</div>'; return; }
+  el.innerHTML = '<div class="empty">搜索中…</div>';
+  let r = [];
+  try { r = await (await fetch('/api/sug?q=' + encodeURIComponent(q))).json(); } catch (e) {}
+  if (r.error) { el.innerHTML = '<div class="empty">' + esc(r.error) + '</div>'; return; }
+  sugRows = r.filter(x => x.type === 'track');
+  if (!r.length) { el.innerHTML = '<div class="empty">无结果</div>'; return; }
+  el.innerHTML = r.map((t) => {
+    if (t.type === 'track') {
+      return `<div class="row"><input type="checkbox" class="cb sgcb" data-id="${t.id}" onchange="selSug(this)">
+        <span class="meta"><div class="t">${esc(t.name)}</div><div class="a">歌曲</div></span></div>`;
+    }
+    if (t.artistId) {
+      return `<div class="row" onclick="openArtistByName('${esc(t.name)}')" style="cursor:pointer">
+        <span class="meta"><div class="t">${esc(t.name)}</div><div class="a">歌手 · 查看全部歌曲 ›</div></span></div>`;
+    }
+    return `<div class="row" style="opacity:.55"><span class="meta"><div class="t">${esc(t.name)}</div>
+        <div class="a">${t.type === 'playlist' ? '歌单' : t.type}</div></span></div>`;
+  }).join('');
+}
+
+// ---------- 歌手主页（GET /luna/pc/artists/{id}/tracks） ----------
+let artistState = { id: '', name: '', cursor: '', hasMore: false };
+async function openArtistByName(name) {
+  const el = document.getElementById('sugList');
+  el.innerHTML = '<div class="empty">正在打开歌手页…</div>';
+  let r = {};
+  try { r = await (await fetch('/api/artist_by_name?name=' + encodeURIComponent(name))).json(); } catch (e) {}
+  if (r.error || !r.id) { el.innerHTML = '<div class="empty">' + esc(r.error || '未解析到歌手') + '</div>'; return; }
+  openArtist(r.id, r.name);
+}
+async function openArtist(id, name) {
+  artistState = { id, name, cursor: '', hasMore: false };
+  document.getElementById('sugList').innerHTML = '<div class="empty">加载中…</div>';
+  await loadArtistPage(true);
+}
+async function loadArtistPage(clear) {
+  const el = document.getElementById('sugList');
+  let r = {};
+  try {
+    r = await (await fetch('/api/artist_tracks?artist_id=' + artistState.id + '&cursor=' + encodeURIComponent(artistState.cursor))).json();
+  } catch (e) { el.innerHTML = '<div class="empty">加载失败</div>'; return; }
+  if (r.error) { el.innerHTML = '<div class="empty">' + esc(r.error) + '</div>'; return; }
+  artistState.hasMore = r.has_more;
+  artistState.cursor = r.cursor || '';
+  if (clear) {
+    el.innerHTML = `<div class="card stickyhead" style="display:flex;align-items:center;gap:10px;margin-bottom:0">
+        <a class="dirlink" onclick="doSug()">‹ 返回搜索</a>
+        <b style="font-size:13px">${esc(artistState.name)}</b>
+        <span style="font-size:12px;color:var(--sub)">本页 ${(r.tracks || []).length} 首</span>
+        <button style="margin-left:auto;border:none;background:#F2F3F5;border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="selectAllArtist()">全选本页</button>
+      </div>`;
+  }
+  const frag = document.createElement('div');
+  frag.innerHTML = (r.tracks || []).map(t => `<div class="row"><input type="checkbox" class="cb arcb" data-id="${t.id}" onchange="selSug(this)">
+      <span class="meta"><div class="t">${esc(t.name)}</div><div class="a">${esc(t.artist)}${t.album ? ' · ' + esc(t.album) : ''}</div></span></div>`).join('');
+  el.appendChild(frag);
+  if (artistState.hasMore) {
+    const more = document.createElement('div');
+    more.className = 'row';
+    more.style.cursor = 'pointer';
+    more.innerHTML = '<span class="meta"><div class="t" style="color:var(--blue)">＋ 加载更多</div></span>';
+    more.onclick = () => { more.remove(); loadArtistPage(false); };
+    el.appendChild(more);
+  }
+}
+function selectAllArtist() {
+  document.querySelectorAll('.arcb').forEach(c => { if (!c.checked) { c.checked = true; selSug(c); } });
+}
+function selSug(cb) {
+  if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+  renderSel();
+}
+function selectAllSug() {
+  document.querySelectorAll('.sgcb').forEach(c => { c.checked = true; selSug(c); });
+}
+
+// ---------- 探测曲目 ----------
+async function loadTracks() {
+  const r = await (await fetch('/api/tracks')).json();
+  const el = document.getElementById('trackList');
+  if (!r.length) { el.innerHTML = '<div class="empty">暂无探测记录 — 确认系统代理开启，然后在客户端播放歌曲</div>'; return; }
+  el.innerHTML = r.map(t =>
+    `<div class="row"><input type="checkbox" class="cb trcb" data-id="${t.id}" onchange="selTrack(this)">
+      <span class="meta"><div class="t">${esc(t.name)}</div><div class="a">${esc(t.artist)} · ${esc(t.album || '')} · ${t.ts}</div></span>
+      <span class="q" onclick="queueAdd([{id:'${t.id}',name:''}]);switchTab('task')">单曲导出</span></div>`).join('');
+}
+function selTrack(cb) {
+  if (cb.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+  renderSel();
+}
+function selectAllTracks() {
+  document.querySelectorAll('.trcb').forEach(c => { c.checked = true; selTrack(c); });
+}
+function addPasted() {
+  const raw = document.getElementById('pasteIds').value;
+  const ids = [...new Set((raw.match(/\d{15,25}/g) || []))];
+  if (!ids.length) return;
+  queueAdd(ids.map(id => ({ id, name: '' })));
+  document.getElementById('pasteIds').value = '';
+}
+
+// ---------- 下载 ----------
+function queueAdd(tracks) {
+  fetch('/api/download', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ids: tracks.map(t => t.id), quality: document.getElementById('quality').value }) });
+  switchTab('task');
+  refresh();
+}
+function doDownload() {
+  if (!selected.size) return;
+  fetch('/api/download', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ids: [...selected], quality: document.getElementById('quality').value }) });
+  selected.clear(); renderSel();
+  switchTab('task'); refresh();
+}
+function renderSel() {
+  document.getElementById('selN').textContent = selected.size;
+  document.getElementById('btnGo').disabled = !selected.size;
+}
+
+// ---------- 任务 ----------
+let lastLog = '';
+async function refresh() {
+  const r = await (await fetch('/api/progress')).json();
+  const el = document.getElementById('taskList');
+  if (!r.items.length) el.innerHTML = '<div class="empty">暂无任务</div>';
+  else el.innerHTML = r.items.slice().reverse().map(t =>
+    `<div class="item"><span class="meta"><div class="t">${esc(t.name || t.id)}</div>
+      <div class="a">${t.status === 'done' ? t.quality + ' · ' + (t.size / 1048576).toFixed(1) + 'MB' : (t.err || '')}</div></span>
+      <span class="st ${t.status}">${{pending:'等待',downloading:'下载中',done:'完成',error:'失败'}[t.status]}</span></div>`).join('');
+  const lg = r.log.join('\n');
+  if (lg !== lastLog) { document.getElementById('log').textContent = lg || '—'; lastLog = lg; }
+  const n = r.items.filter(t => t.status === 'pending' || t.status === 'downloading').length;
+  document.getElementById('taskBadge').textContent = n ? '(' + n + ')' : '';
+  if (mode === 'task') setTimeout(refresh, 1500);
+}
+setInterval(() => { if (mode !== 'task') { fetch('/api/progress').then(r => r.json()).then(r => {
+  const n = r.items.filter(t => t.status === 'pending' || t.status === 'downloading').length;
+  document.getElementById('taskBadge').textContent = n ? '(' + n + ')' : '';
+}); } }, 3000);
+function esc(s) { return String(s || '').replace(/'/g, '&#39;').replace(/</g, '&lt;'); }
+
+// ---------- 设备身份 / 兜底登录态 ----------
+async function loadDeviceBar() {
+  const el = document.getElementById('devbar');
+  if (!el) return;
+  try {
+    const d = await (await fetch('/api/device')).json();
+    const didShort = d.did ? ('…' + String(d.did).slice(-6)) : '—';
+    const ck = d.cookie ? ('已同步（' + d.cookie + ' 字符）') : '未使用（无状态）';
+    el.innerHTML =
+      '设备身份：<b>' + didShort + '</b> <a class="dirlink" onclick="resetDevice()">重新注册</a>' +
+      ' ｜ 兜底登录态：' + ck +
+      ' <a class="dirlink" onclick="syncSession()">从客户端同步</a>' +
+      (d.cookie ? ' <a class="dirlink" onclick="clearSession()">清除</a>' : '') +
+      ' ｜ <a class="dirlink" onclick="selfCheck()">环境自检</a>';
+  } catch (e) { el.textContent = '设备信息读取失败'; }
+}
+async function selfCheck() {
+  const el = document.getElementById('devbar');
+  el.textContent = '自检中…（会实际取一次流）';
+  try {
+    const r = await (await fetch('/api/selfcheck')).json();
+    const old = document.getElementById('scPanel');
+    if (old) old.remove();
+    const box = document.createElement('pre');
+    box.id = 'scPanel';
+    box.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:60vh;overflow:auto;background:#fff;' +
+      'border-top:1px solid #E5E7EB;box-shadow:0 -4px 20px rgba(0,0,0,.08);margin:0;padding:16px 18px;' +
+      'font:12.5px/1.75 ui-monospace,Consolas,monospace;z-index:200;white-space:pre-wrap';
+    box.textContent = (r.text || JSON.stringify(r, null, 2)) +
+      '\n\n── 点击任意处关闭（完整结果已存到下载目录 _selfcheck.txt）';
+    box.onclick = () => box.remove();
+    document.body.appendChild(box);
+  } catch (e) { alert('自检失败: ' + e.message); }
+  loadDeviceBar();
+}
+async function resetDevice() {
+  if (!confirm('重新注册设备身份？\n\n会向服务器申请一个新的设备 ID（did/iid）。\n适用于：换机器，或想换一个干净身份。')) return;
+  const el = document.getElementById('devbar');
+  el.textContent = '正在注册…';
+  const r = await (await fetch('/api/device_reset')).json();
+  if (r.error) alert('注册失败：' + r.error); else alert('已注册新设备：' + r.did);
+  loadDeviceBar();
+}
+async function syncSession() {
+  if (!confirm('从本机汽水客户端同步登录态？\n\n需要：① 装过汽水音乐 PC 客户端 ② 在客户端里登录过 ③ 当前已完全退出客户端。\n\n说明：这是可选兜底。不带登录态也能正常搜索 / 下载。')) return;
+  const el = document.getElementById('devbar');
+  el.textContent = '正在从客户端提取登录态…';
+  const r = await (await fetch('/api/refresh_session')).json();
+  if (r.error) alert('同步失败：' + r.error); else alert('已同步登录态（' + r.cookies + ' 个 cookie）');
+  loadDeviceBar();
+}
+async function clearSession() {
+  await fetch('/api/clear_session');
+  loadDeviceBar();
+}
+loadDeviceBar();
+
+function quitApp() {
+  if (!confirm('彻底退出汽水导出？\n\n注意：关掉这个窗口只是收起界面，后台服务还在跑（所以双击图标不一定会开新窗口）；\n这里会把服务一起停掉。')) return;
+  fetch('/api/quit').then(() => {
+    document.body.innerHTML = '<div style="padding:120px 0;text-align:center;color:#8A8F99;font-size:15px">已退出，可以关掉这个窗口了</div>';
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -325,7 +325,7 @@ async function resetDevice() {
   loadDeviceBar();
 }
 async function syncSession() {
-  if (!confirm('从本机汽水客户端同步登录态？\n\n需要：① 装过汽水音乐 PC 客户端 ② 在客户端里登录过 ③ 当前已完全退出客户端。\n\n说明：这是可选兜底。不带登录态也能正常搜索 / 下载。')) return;
+  if (!confirm('从本机汽水客户端同步登录态？\n\n需要：① 装过汽水音乐 PC 客户端 ② 在客户端里登录过 ③ 当前已完全退出客户端。\n\n说明：不带登录态时，VIP 专属歌只能拿到约 30 秒的试听片段；同步后才有完整时长和无损。')) return;
   const el = document.getElementById('devbar');
   el.textContent = '正在从客户端提取登录态…';
   const r = await (await fetch('/api/refresh_session')).json();

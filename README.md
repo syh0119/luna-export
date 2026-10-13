@@ -8,7 +8,7 @@
 
 ## 电脑端
 
-`pc/` 是同一件事的电脑版，一个 exe 双击打开网页界面，搜索或粘贴 track_id 出无损 FLAC，不依赖手机也不依赖客户端。详细说明在 [pc/README.md](pc/README.md)。
+`pc/` 是同一件事的电脑版，一个 exe 双击打开网页界面，搜索或粘贴 track_id 出无损 FLAC，不依赖手机（签名模块打包在 exe 里）。详细说明在 [pc/README.md](pc/README.md)。
 
 ## 用法
 
@@ -26,10 +26,18 @@ LSPosed 模式的话，在 LSPosed 里启用模块，作用域勾「汽水音乐
 
 找密钥时先看 tenc box 里的 KID 在不在索引里，没有就拿文件名 md5 反查 vid。标题、歌手、专辑、歌词、封面这些从宿主的 sqlite、keva 和网络缓存里抽出来。
 
+## 关于会员和音质
+
+这个工具只做「把已经拿到的加密流解开」，不掺和会员判定。
+
+手机端解的是本地缓存，汽水自己下到 `.mdl` 里的是什么质量，解开就是什么质量，工具不会把 128kbps 变无损。电脑端是主动去取流，这时候能不能拿到完整歌曲和无损，由服务端按登录态决定：同一个设备 ID，不带 cookie 请求 VIP 专属歌，只返回约 30 秒、单个 `higher` 档；带上会员账号的登录态，才给完整时长和全部档位（含 `hi_res` / `lossless`）。免费歌两边都不受影响，匿名也能完整拿到，有时候还给到无损。
+
+所以在电脑端要下 VIP 音乐，还是得有 VIP 的登录态。往请求里塞 `is_vip=1`、`enable_lossless=1`、`quality=lossless` 之类的参数全试过，一个都没用；试听凭证 `LimitedFreeInfo` 本身带着服务端签名（`sign` / `sign_version` / `expire_time`），客户端也改不动。
+
 ## 相关项目
 
 - [yeqiu6080/qishui-decrypt](https://github.com/yeqiu6080/qishui-decrypt) — 汽水解密的纯前端 JS 实现
 - [jixunmoe/export_music](https://github.com/jixunmoe/export_music) — 从手机导出解密音乐的 Python 工具，SpadeDecryptor 出处
 - [BilMiauz/NcmDumpAndroid](https://github.com/BilMiauz/NcmDumpAndroid) — 网易云版的同类思路，架构参考
 
-汽水现有的 Xposed 模块（Deer God、moonhook 之类）都只做 VIP 绕过，没有做本地解密的。
+汽水现有的 Xposed 模块（Deer God、moonhook 之类）走的是另一条路，解锁客户端里的音质选项，不做本地解密。

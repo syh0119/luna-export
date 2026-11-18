@@ -82,6 +82,8 @@ public class MainActivity extends Activity {
         append("输出到 /sdcard/" + Exporter.REL + "/");
         append("⚠️ 不会自动导出：只有你点「导出选中」才会产出文件。");
         append("用法：点「扫描曲目」→ 勾选想要的 → 点底部按钮导出。");
+        // 上次崩了/被杀留下的暂存残留，开 App 就清掉（暂存区是宿主私有数据的副本）
+        Dirs.cleanupStale(this);
         refreshChips();
         refreshStatus();
         handleIntent();
@@ -133,7 +135,9 @@ public class MainActivity extends Activity {
         if (it == null) return;
         if (it.getBooleanExtra("diag", false)) {
             append("=== su 诊断 ===");
-            new Thread(new Runnable() { public void run() { append(Dirs.diagnose()); } }, "diag").start();
+            new Thread(new Runnable() { public void run() {
+                append(Dirs.diagnose(MainActivity.this));
+            } }, "diag").start();
             return;
         }
         if (it.getBooleanExtra("auto", false)) {

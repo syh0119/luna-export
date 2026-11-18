@@ -42,7 +42,9 @@ public final class IndexBuilder {
         // 自己在 hook 里攒下的响应体。
         // 宿主的元数据只在「最近浏览/播放过」的歌上留缓存，且 sqlite 的 WAL 会失效；
         // 我们这份是长期累积、不会过期的补充，专门补那些查不到歌名的曲目。
-        for (String b : BlobStore.load(BlobStore.file(root))) s.feed(b);
+        // ⚠️ 暂存区是扁平命名，仓库位置要用 fileStaged，否则 root 模式读不到。
+        File bf = staged ? BlobStore.fileStaged(root) : BlobStore.file(root);
+        for (String b : BlobStore.load(bf)) s.feed(b);
         return s.finish();
     }
 

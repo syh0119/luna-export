@@ -1,34 +1,49 @@
 #!/usr/bin/env bash
 # 汽水导出 · 单个 APK（LSPosed 模块 + 普通应用 二合一）
 # 无 Gradle 手动构建：aapt2 + javac + d8 + zipalign + apksigner
+#
+# 路径全部自定位：仓库根 = 本脚本所在目录；工具链走环境变量，缺省找 D:/WorkBuddy/_tools。
 set -e
 
-ROOT="D:/WorkBuddy/2026-10-09-18-38-30/luna-lsp"
-TOOLS="D:/WorkBuddy/2026-10-09-14-12-52/build/tools"
-SDK="$TOOLS/sdk"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ⚠️ 统一用 Windows 形式（D:/...）作为基准：
+#    · Git Bash 的 find/mkdir/rm 完全能处理 D:/... 路径；
+#    · javac/aapt2/d8 这些原生 Windows 程序只认 D:/...，认不出 /d/...；
+#    · 尤其 classpath 里的 ';' 会被 shell 当命令分隔 —— 两边形式一致才不会踩。
+ROOTW="$(cygpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
+ROOT="$ROOTW"
+TOOLS="${LUNA_TOOLS:-D:/WorkBuddy/_tools}"
+SDK="${ANDROID_SDK_ROOT:-$TOOLS/android-sdk}"
 BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
-JAVAC="$TOOLS/jdk/bin/javac.exe"
+JAVAC="${JAVA_HOME:-$TOOLS/jdk}/bin/javac.exe"
 AAPT2="$BT/aapt2.exe"
 D8="$BT/d8.bat"
 ZIPALIGN="$BT/zipalign.exe"
 APKSIGNER="$BT/apksigner.bat"
-KS="D:/WorkBuddy/2026-10-09-14-12-52/build/debug.keystore"
+KS="${LUNA_KEYSTORE:-$TOOLS/keystore/debug.keystore}"
 XPOSED="$ROOT/lib/api-82.jar"
-PY="C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+PY="${LUNA_PYTHON:-C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
 
 # d8/apksigner 是 .bat，需要 JAVA_HOME
-export JAVA_HOME="$(cygpath -w "$TOOLS/jdk" 2>/dev/null || echo "$TOOLS/jdk")"
+if [ -z "$JAVA_HOME" ]; then
+  export JAVA_HOME="${LUNA_JDK:-$TOOLS/jdk}"
+fi
 
 APP="$ROOT/app"
 OUT="$ROOT/out/apk"
 MIN_SDK=29
 TGT_SDK=34
-VER_CODE=3
-VER_NAME=1.1.2
+# ⚠️ 版本号以 app/AndroidManifest.xml 为准 —— aapt2 link 的 --version-name/--version-code
+#    压不过 manifest 里已声明的值（旧版本就栽在这：发布名叫 1.1.2，APK 内部却是 1.1.0）。
+#    所以这里两个值都从 manifest 里读出来，保证文件名与包内版本永远一致。
+VER_CODE="$(sed -n 's/.*android:versionCode="\([0-9]*\)".*/\1/p' "$APP/AndroidManifest.xml" | head -1)"
+VER_NAME="$(sed -n 's/.*android:versionName="\([^"]*\)".*/\1/p' "$APP/AndroidManifest.xml" | head -1)"
+: "${VER_CODE:=1}"
+: "${VER_NAME:=0.0.0}"
 
 echo "==================================================="
-echo " 构建 汽水导出 (LSPosed 模块 + 独立 App 二合一)  v$VER_NAME"
+echo " 构建 汽水导出 (LSPosed 模块 + 独立 App 二合一)  v$VER_NAME (code $VER_CODE)"
 echo "==================================================="
 
 rm -rf "$OUT"
@@ -49,10 +64,30 @@ echo "[2/7] aapt2 link（含 assets/xposed_init）…"
   --version-code "$VER_CODE" \
   --version-name "$VER_NAME" \
   "$OUT/res.zip"
-
 echo "[3/7] javac 编译…"
 SRCS=$(find "$ROOT/core/src" "$ROOT/android/src" "$ROOT/module/src" "$ROOT/app/src" "$OUT/gen" -name '*.java' 2>/dev/null | tr '\n' ' ')
 echo "      源文件: $(echo $SRCS | wc -w) 个"
+
+# ---- 先跑离线自测（暂存命令的 shell 语法 + 复制清单完整性）----
+# 这一步只需要纯 Java（StageCmd / DirsSelfTest 不依赖 Android），失败就别打包了。
+echo "      离线自测 …"
+SELFTEST_OUT="$OUT/selftest"
+rm -rf "$SELFTEST_OUT"; mkdir -p "$SELFTEST_OUT"
+set +e
+"$JAVAC" -encoding UTF-8 -nowarn -d "$SELFTEST_OUT" \
+  "$ROOT/android/src/com/syh/luna/android/StageCmd.java" \
+  "$ROOT/android/src/com/syh/luna/android/DirsSelfTest.java" > "$OUT/selftest.log" 2>&1
+if [ $? -ne 0 ]; then
+  set -e; echo "!! 自测编译失败"; cat "$OUT/selftest.log"; exit 1
+fi
+JAVA_BIN="$(dirname "$JAVAC")/java.exe"
+"$JAVA_BIN" -Dfile.encoding=UTF-8 -cp "$SELFTEST_OUT" com.syh.luna.android.DirsSelfTest > "$OUT/selftest.log" 2>&1
+RC=$?
+set -e
+grep -a "FAIL" "$OUT/selftest.log" | head -10 || true
+if [ $RC -ne 0 ]; then echo "!! 自测未通过（详见 out/apk/selftest.log）"; cat "$OUT/selftest.log"; exit 1; fi
+echo "      自测通过"
+
 set +e
 "$JAVAC" -encoding UTF-8 -nowarn \
   -source 8 -target 8 \
@@ -69,7 +104,6 @@ echo "      javac OK"
 echo "[4/7] d8 转 dex…"
 # ⚠️ class 一多，逐个文件传参会撞 Windows 命令行长度上限（"命令行太长"）。
 #    先打成 jar 再交给 d8，参数就只剩一个路径。
-"C:/Program Files/Java/jdk/bin/jar.exe" --version >/dev/null 2>&1 || true
 JARBIN="$(dirname "$JAVAC")/jar.exe"
 rm -f "$OUT/classes.jar"
 "$JARBIN" cf "$OUT/classes.jar" -C "$OUT/classes" .

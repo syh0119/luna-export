@@ -195,6 +195,8 @@ public final class Exporter {
         public long preparedMs;
         public int changedCount, newCount;
         public String error;
+        /** 拿回 Context：导出结束要清暂存区，二次导出还要能重新暂存 */
+        public Context ctx;
         /**
          * 是否额外输出侧车 `.lrc` 文件。
          *
@@ -260,6 +262,7 @@ public final class Exporter {
     public static Session prepare(Context ctx, boolean rootMode, Log log, Progress prog) {
         long t0 = System.currentTimeMillis();
         Session s = new Session();
+        s.ctx = ctx;
 
         if (rootMode) {
             if (!Dirs.hasRoot()) {
@@ -269,7 +272,7 @@ public final class Exporter {
             }
             if (log != null) log.line("su 暂存宿主私有目录 …");
             try {
-                s.root = Dirs.stage();
+                s.root = Dirs.stage(ctx);
             } catch (Exception e) {
                 s.error = "su 暂存失败: " + e.getMessage();
                 if (log != null) log.line("✗ " + s.error);
@@ -528,6 +531,20 @@ public final class Exporter {
             return st;
         }
 
+        // 暂存区可能已经被清掉了（上次导出结束就清了）—— 重新暂存一次
+        if (s.staged && !Dirs.stageAlive(s.root)) {
+            if (log != null) log.line("暂存区已失效，重新暂存 …");
+            try {
+                s.root = Dirs.stage(s.ctx);
+            } catch (Exception e) {
+                st.failed = chosen.size();
+                if (log != null) log.line("✗ 重新暂存失败: " + e.getMessage());
+                st.ms = System.currentTimeMillis() - t0;
+                return st;
+            }
+            s.base = Dirs.lastBase;
+        }
+
         StringBuilder report = new StringBuilder("[\n");
         boolean first = true;
         int done = 0;
@@ -619,6 +636,15 @@ public final class Exporter {
         lg.append("索引: ").append(s.indexInfo).append('\n');
         lg.append(st.summary()).append('\n');
         s.sink.put("_导出日志.txt", lg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        // ---- 收尾：清掉暂存区
+        // 暂存区是宿主私有数据的**完整副本**（.mdl / sqlite / keva / 缓存 / 密钥仓），
+        // 即使用完了也不该留在设备上。暂存在本 App 私有目录里、属主已 chown 回本 App，
+        // 所以纯 Java 递归删即可，不需要 root。
+        if (s.staged) {
+            Dirs.cleanup(s.root);
+            if (log != null) log.line("已清理暂存区（宿主私有数据副本不留存）");
+        }
         return st;
     }
 

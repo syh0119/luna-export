@@ -35,6 +35,16 @@ public final class BlobStore {
         return new File(new File(hostRoot, KeyVault.DIR), "blobs.bin");
     }
 
+    /**
+     * 暂存模式下的仓库位置。
+     *
+     * ⚠️ 暂存区里的子目录是**扁平命名**（`files/luna_export` → `files_luna_export`），
+     *   所以不能直接用 {@link #file(File)}，否则 root 模式下读不到 LSPosed 攒的元数据。
+     */
+    public static File fileStaged(File stageRoot) {
+        return new File(new File(stageRoot, KeyVault.DIR.replace('/', '_')), "blobs.bin");
+    }
+
     /** 追加一条。只接受可能含曲目/映射信息的文本，避免把整个仓库塞满垃圾 */
     public static synchronized boolean append(File f, String s) {
         if (f == null || s == null || s.length() < 64) return false;

@@ -27,7 +27,8 @@ public final class KeyVault {
 
     /** 独立模式：su 暂存过来的副本 */
     public static File inStage(File stageRoot) {
-        return new File(new File(stageRoot, "files_luna_export"), FILE);
+        // 暂存区子目录是扁平命名（files/luna_export → files_luna_export），与 Dirs.logical 一致
+        return new File(new File(stageRoot, DIR.replace('/', '_')), FILE);
     }
 
     /** 读取已抓到的密钥 */

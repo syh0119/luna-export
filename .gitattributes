@@ -1,7 +1,23 @@
+# 统一用 LF。
+# ⚠️ 本仓库以前没写 eol=lf，在 Windows 的 core.autocrlf=true 下，
+#    git 会把工作区的 LF 转成 CRLF 再入库 —— 于是仓库里的 blob 本身含 CRLF，
+#    重新 checkout 后 hash 与 index 对不上，git status 永远显示一堆「已修改」。
+#    （实测 Exporter.java / MediaStoreSink.java / AndroidManifest.xml 长期伪 dirty，
+#      字节级与 HEAD 完全相同，git diff --ignore-cr-at-eol 为空。）
+* text=auto eol=lf
 *.sh text eol=lf
-*.java text
-*.md text
-*.xml text
+*.java text eol=lf
+*.md text eol=lf
+*.xml text eol=lf
+*.json text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
 *.png binary
+*.jpg binary
 *.jar binary
 *.apk binary
+*.idsig binary

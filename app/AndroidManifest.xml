@@ -6,8 +6,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.syh.luna"
-    android:versionCode="5"
-    android:versionName="1.1.4">
+    android:versionCode="6"
+    android:versionName="1.1.5">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
 
@@ -51,7 +51,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="被动抓取加密密钥与曲目元数据（每次几十 KB，不产生歌曲、不加界面）。导出全部由本 App 自己完成：用 root 读汽水音乐私有目录里的 .mdl，离线解密 CENC(AES-128-CTR) 为无损 FLAC / M4A，写入 标题·歌手·专辑·歌词·封面 后输出到 Music/汽水导出/。" />
+            android:value="被动抓取加密密钥与曲目元数据（每次几十 KB，不产生歌曲、不加界面）。导出全部由本 App 自己完成：用 root 按需读取汽水音乐私有目录里的 .mdl，离线解密 CENC(AES-128-CTR) 为无损 FLAC / M4A / MP3，写入 标题·歌手·专辑·歌词·封面 后输出到 Music/汽水导出/。" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

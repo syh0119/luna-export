@@ -8,6 +8,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * 定位 / 暂存宿主私有数据目录。
@@ -118,6 +125,19 @@ public final class Dirs {
         return stageViaCopy(ctx);
     }
 
+    public static final class MdlEntry {
+        public final String name;
+        public final long size;
+        public final long mtimeSec;
+        public MdlEntry(String name, long size, long mtimeSec) {
+            this.name = name;
+            this.size = size;
+            this.mtimeSec = mtimeSec;
+        }
+    }
+
+    /** 最近一次暂存扫描到的宿主 files/music/*.mdl 元清单 */
+    public static volatile List<MdlEntry> lastMdlList = Collections.emptyList();
     /** tar 路径失败的原因（诊断用） */
     public static volatile String lastTarError = "";
     /** tar 路径解出的文件数（诊断用） */
@@ -128,48 +148,36 @@ public final class Dirs {
     public static volatile String lastStageList = "";
 
     /**
-     * tar 流路径：su 只读，App 自己解包。
+     * tar 流路径：su 只读元数据目录，App 自己解包；.mdl 本体只列元清单。
      */
     static File stageViaTar(Context ctx, String tarStyle) throws IOException {
         File dest = stageDir(ctx);
         if (!dest.isDirectory() && !dest.mkdirs() && !dest.isDirectory()) {
             throw new IOException("无法创建暂存目录: " + dest);
         }
-        // 清空上一次残留（纯 Java，不需要 root）
         cleanup(dest);
 
         String cmd = StageCmd.buildTar(tarStyle);
         Process p = null;
         InputStream in = null;
+        StringBuilder errBuf = new StringBuilder();
         try {
-            p = new ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start();
+            p = new ProcessBuilder("su", "-c", cmd).redirectErrorStream(false).start();
+            Thread errThread = drainAsync(p.getErrorStream(), errBuf, 8192);
             in = p.getInputStream();
 
-            // ---- 先读文本诊断，直到遇到 LUNA_TAR_BEGIN 标记
-            //      逐字节读，不多读 —— 标记之后紧跟着的就是二进制 tar 数据
-            StringBuilder head = new StringBuilder();
-            int ch;
-            boolean found = false;
-            while ((ch = in.read()) >= 0) {
-                head.append((char) ch);
-                if (head.length() > 8192) break;      // 诊断不该这么长
-                String h = head.toString();
-                int bi = h.indexOf(StageCmd.TAR_BEGIN);
-                if (bi >= 0) {
-                    found = true;
-                    lastSuOutput = h.substring(0, bi);   // 标记之前全是文本诊断
-                    break;
-                }
-            }
-            if (!found) {
-                throw new IOException("su 输出里没有 tar 流标记（su 侧输出："
-                        + head.toString().trim() + "）");
+            try {
+                lastSuOutput = readHeaderUntil(in, StageCmd.TAR_BEGIN, 2 * 1024 * 1024);
+            } catch (IOException e) {
+                try { errThread.join(300); } catch (InterruptedException ignore) { }
+                String err = errBuf.toString().trim();
+                throw new IOException(e.getMessage() + (err.isEmpty() ? "" : " | stderr: " + err));
             }
 
-            // ---- 解析文本诊断
             lastBase = field(lastSuOutput, "LUNA_BASE=");
             lastCount = field(lastSuOutput, "LUNA_COUNT=");
             lastStageList = field(lastSuOutput, "LUNA_LIST=");
+            lastMdlList = parseMdlList(lastSuOutput);
             if (lastSuOutput.contains("LUNA_NO_BASE")) {
                 throw new IOException("su 读不到宿主私有目录（两个候选路径都没有内容）");
             }
@@ -177,9 +185,7 @@ public final class Dirs {
                 throw new IOException("宿主私有目录里一个目标子目录都没有（列表为空）");
             }
 
-            // ---- 解包：文件全部由 App 创建，属主与标签天然正确
-            // ⚠️ 传 SUB 清单做精确前缀映射：files/music/x.mdl → files_music/x.mdl
-            Tar.Result tr = Tar.extract(in, dest, StageCmd.SUB);
+            Tar.Result tr = Tar.extract(in, dest, StageCmd.META_SUB);
             lastTarFiles = tr.files;
             lastTarBytes = tr.bytes;
 
@@ -190,8 +196,9 @@ public final class Dirs {
                 rc = -1;
                 Thread.currentThread().interrupt();
             }
+            try { errThread.join(300); } catch (InterruptedException ignore) { }
             lastSuCode = rc;
-            if (tr.files == 0) {
+            if (lastMdlList.isEmpty() && tr.files == 0) {
                 throw new IOException("tar 解包出来 0 个文件（su 退出码 " + rc + "）");
             }
         } finally {
@@ -199,11 +206,6 @@ public final class Dirs {
             if (p != null) p.destroy();
         }
 
-        // ---- 校验：App 自己写的目录，App 一定看得见
-        File music = new File(dest, "files_music");
-        if (!music.isDirectory()) {
-            throw new IOException("解包后没有 files_music 目录（暂存区结构不对）");
-        }
         return dest;
     }
 
@@ -268,6 +270,7 @@ public final class Dirs {
         lastDirLabel = field(out, "DIRLABEL=");
         lastOwner = field(out, "OWNER=");
         lastCount = field(out, "COUNT=");
+        lastMdlList = parseMdlList(out);
 
         // ---- 回读校验：App 侧必须真的能看到 su 写出来的东西
         File ok = new File(dest, ".luna_ok");
@@ -302,7 +305,202 @@ public final class Dirs {
 
     /** 暂存目录是否还在（导出期间可能被清理过，需要重新暂存） */
     public static boolean stageAlive(File root) {
-        return root != null && new File(root, "files_music").isDirectory();
+        return root != null && root.isDirectory()
+                && (new File(root, "databases").isDirectory()
+                || new File(root, "files_keva").isDirectory()
+                || new File(root, "files_music").isDirectory());
+    }
+
+    /** 按需读取单个宿主 .mdl 完整字节流 */
+    public static byte[] readHostMdl(String base, String name, long sizeHint) throws IOException {
+        String cmd = StageCmd.buildReadFile(base, name);
+        Process p = null;
+        InputStream in = null;
+        StringBuilder errBuf = new StringBuilder();
+        try {
+            p = new ProcessBuilder("su", "-c", cmd).redirectErrorStream(false).start();
+            Thread errThread = drainAsync(p.getErrorStream(), errBuf, 4096);
+            in = p.getInputStream();
+            readHeaderUntil(in, StageCmd.FILE_BEGIN, 8192);
+            int hint = sizeHint > 0 && sizeHint <= Integer.MAX_VALUE ? (int) sizeHint : 65536;
+            byte[] data = com.syh.luna.core.Index.readBytes(in, hint);
+            try { p.waitFor(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            try { errThread.join(200); } catch (InterruptedException ignore) { }
+            return data;
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignore) { }
+            if (p != null) p.destroy();
+        }
+    }
+
+    /** 分批批量读取多个宿主 .mdl 的头部（前 maxBytes 字节） */
+    public static Map<String, byte[]> readHostMdlHeads(String base, List<String> names, int maxBytes) {
+        Map<String, byte[]> out = new LinkedHashMap<String, byte[]>();
+        if (base == null || base.isEmpty() || names == null || names.isEmpty()) return out;
+        final int batchSize = 80;
+        for (int i = 0; i < names.size(); i += batchSize) {
+            List<String> sub = names.subList(i, Math.min(names.size(), i + batchSize));
+            readHeadBatchInto(base, sub, maxBytes, out);
+            for (String nm : sub) {
+                if (!out.containsKey(nm)) {
+                    try {
+                        byte[] single = readHostMdlHeadSingle(base, nm, maxBytes);
+                        if (single != null) out.put(nm, single);
+                    } catch (Throwable ignore) { }
+                }
+            }
+        }
+        return out;
+    }
+
+    private static void readHeadBatchInto(String base, List<String> batch, int maxBytes, Map<String, byte[]> out) {
+        String cmd = StageCmd.buildReadHeadBatch(base, batch, maxBytes);
+        Process p = null;
+        InputStream in = null;
+        StringBuilder errBuf = new StringBuilder();
+        try {
+            p = new ProcessBuilder("su", "-c", cmd).redirectErrorStream(false).start();
+            Thread errThread = drainAsync(p.getErrorStream(), errBuf, 4096);
+            in = p.getInputStream();
+            readHeaderUntil(in, StageCmd.HEAD_BEGIN, 8192);
+            while (true) {
+                String line = readLineAscii(in);
+                if (line == null) break;
+                if (!line.startsWith("H ")) continue;
+                int sp = line.indexOf(' ', 2);
+                if (sp <= 2) continue;
+                int n;
+                try { n = Integer.parseInt(line.substring(2, sp)); } catch (NumberFormatException e) { break; }
+                String fname = line.substring(sp + 1);
+                if (n < 0 || n > maxBytes + 4096) break;
+                byte[] buf = new byte[n];
+                int got = n == 0 ? 0 : Tar.readFully(in, buf, n);
+                if (got < n) break;
+                out.put(fname, buf);
+            }
+            try { p.waitFor(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            try { errThread.join(200); } catch (InterruptedException ignore) { }
+        } catch (Throwable ignore) {
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignore) { }
+            if (p != null) p.destroy();
+        }
+    }
+
+    private static byte[] readHostMdlHeadSingle(String base, String name, int maxBytes) throws IOException {
+        Map<String, byte[]> tmp = new LinkedHashMap<String, byte[]>();
+        readHeadBatchInto(base, Collections.singletonList(name), maxBytes, tmp);
+        return tmp.get(name);
+    }
+
+    private static String readHeaderUntil(InputStream in, String markerStr, int maxBytes) throws IOException {
+        byte[] marker = markerStr.getBytes(StandardCharsets.UTF_8);
+        int mlen = marker.length;
+        byte[] buf = new byte[Math.min(8192, maxBytes)];
+        int len = 0;
+        int ch;
+        while ((ch = in.read()) >= 0) {
+            if (len >= buf.length) {
+                if (buf.length >= maxBytes) break;
+                int ncap = Math.min(maxBytes, buf.length * 2);
+                byte[] nb = new byte[ncap];
+                System.arraycopy(buf, 0, nb, 0, len);
+                buf = nb;
+            }
+            buf[len++] = (byte) ch;
+            if (len >= mlen && buf[len - 1] == marker[mlen - 1]) {
+                boolean ok = true;
+                for (int i = 0; i < mlen - 1; i++) {
+                    if (buf[len - mlen + i] != marker[i]) { ok = false; break; }
+                }
+                if (ok) {
+                    return new String(buf, 0, len - mlen, StandardCharsets.UTF_8);
+                }
+            }
+            if (len >= maxBytes) break;
+        }
+        throw new IOException("su 输出里没有标记 " + markerStr.trim()
+                + "（su 侧输出：" + new String(buf, 0, len, StandardCharsets.UTF_8).trim() + "）");
+    }
+
+    private static String readLineAscii(InputStream in) throws IOException {
+        byte[] buf = new byte[512];
+        int len = 0;
+        int ch;
+        while ((ch = in.read()) >= 0) {
+            if (ch == '\n') return new String(buf, 0, len, StandardCharsets.UTF_8);
+            if (len == buf.length) {
+                byte[] nb = new byte[buf.length * 2];
+                System.arraycopy(buf, 0, nb, 0, len);
+                buf = nb;
+            }
+            buf[len++] = (byte) ch;
+        }
+        return len == 0 ? null : new String(buf, 0, len, StandardCharsets.UTF_8);
+    }
+
+    private static Thread drainAsync(final InputStream err, final StringBuilder into, final int maxChars) {
+        Thread t = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    byte[] b = new byte[2048];
+                    int n;
+                    while ((n = err.read(b)) > 0) {
+                        if (into.length() < maxChars) {
+                            into.append(new String(b, 0, n, StandardCharsets.UTF_8));
+                        }
+                    }
+                } catch (Throwable ignore) { }
+            }
+        }, "su-stderr");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    static List<MdlEntry> parseMdlList(String text) {
+        List<MdlEntry> list = new ArrayList<MdlEntry>();
+        if (text == null || text.isEmpty()) return list;
+        String[] lines = text.split("\n");
+        for (String line : lines) {
+            if (!line.startsWith("LUNA_MDL=")) continue;
+            String rest = line.substring(9).trim();
+            int c1 = rest.indexOf(':');
+            if (c1 <= 0) continue;
+            int c2 = rest.indexOf(':', c1 + 1);
+            if (c2 <= c1 + 1) continue;
+            try {
+                long sz = Long.parseLong(rest.substring(0, c1));
+                long mt = Long.parseLong(rest.substring(c1 + 1, c2));
+                String nm = rest.substring(c2 + 1);
+                if (!nm.isEmpty()) list.add(new MdlEntry(nm, sz, mt));
+            } catch (NumberFormatException ignore) { }
+        }
+        Collections.sort(list, new Comparator<MdlEntry>() {
+            public int compare(MdlEntry a, MdlEntry b) { return a.name.compareTo(b.name); }
+        });
+        return list;
+    }
+
+    /** 批量删除宿主 files/music 下的 .mdl 及伴生 .mdlnodeconf，返回实际删除成功的文件名集合 */
+    public static java.util.Set<String> deleteHostMdls(String base, List<String> names) {
+        java.util.Set<String> deleted = new java.util.LinkedHashSet<String>();
+        if (!StageCmd.allowedHostBase(base) || names == null || names.isEmpty()) return deleted;
+        final int batchSize = 80;
+        for (int i = 0; i < names.size(); i += batchSize) {
+            List<String> sub = names.subList(i, Math.min(names.size(), i + batchSize));
+            String cmd = StageCmd.buildDeleteMdl(base, sub);
+            if (cmd.isEmpty()) continue;
+            String out = su(cmd);
+            if (out == null) continue;
+            for (String line : out.split("\n")) {
+                if (line.startsWith("DEL_OK=")) {
+                    String nm = line.substring(7).trim();
+                    if (!nm.isEmpty()) deleted.add(nm);
+                }
+            }
+        }
+        return deleted;
     }
 
     /**

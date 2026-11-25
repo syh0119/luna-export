@@ -47,18 +47,21 @@ public class MainActivity extends Activity {
     static final int OK_D = 0xFF3DD68C, OKBG_D = 0xFF12291E;
     static final int WARN_L = 0xFFD97706, WARNBG_L = 0xFFFDF3E2;
     static final int WARN_D = 0xFFF0B45A, WARNBG_D = 0xFF2E2412;
+    static final int DANGER_L = 0xFFE53935, DANGERBG_L = 0xFFFDECEC;
+    static final int DANGER_D = 0xFFFF6B6B, DANGERBG_D = 0xFF331818;
     static final int WHITE = 0xFFFFFFFF;
 
     // 当前生效
     private boolean dark;
-    private int ACCENT, BG, CARD, TEXT, SUB, LINE, FILL, OK, OKBG, WARN, WARNBG;
+    private int ACCENT, BG, CARD, TEXT, SUB, LINE, FILL, OK, OKBG, WARN, WARNBG, DANGER, DANGERBG;
 
     private Exporter.Session session;
     private final List<Exporter.Item> rows = new ArrayList<Exporter.Item>();
     private RowAdapter adapter;
 
     private TextView chipTotal, chipReady, chipPicked, chipFilter, statMain, statSub, autoSub;
-    private TextView logView, progressText, emptyHint;
+    private TextView sortAlphaBtn, sortSizeBtn, sortTimeBtn;
+    private TextView logView, progressText, emptyHint, scanBtn, deleteBtn;
     private android.widget.EditText search;
     private String query = "";
     private ProgressBar bar;
@@ -70,6 +73,8 @@ public class MainActivity extends Activity {
     private boolean logOpen;
     /** false = 列表只显示能操作的（可导出/已导出）；true = 全部 .mdl */
     private boolean showAll;
+    private int sortMode = Exporter.SORT_ALPHA;
+    private boolean sortAsc = true;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -77,6 +82,8 @@ public class MainActivity extends Activity {
                 & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         initPalette();
         super.onCreate(b);
+        sortMode = Exporter.sortMode(this);
+        sortAsc = Exporter.sortAsc(this);
         setContentView(buildUi());
         append("汽水导出 v" + versionName());
         append("输出到 /sdcard/" + Exporter.REL + "/");
@@ -121,6 +128,8 @@ public class MainActivity extends Activity {
         OKBG = dark ? OKBG_D : OKBG_L;
         WARN = dark ? WARN_D : WARN_L;
         WARNBG = dark ? WARNBG_D : WARNBG_L;
+        DANGER = dark ? DANGER_D : DANGER_L;
+        DANGERBG = dark ? DANGERBG_D : DANGERBG_L;
     }
 
     @Override
@@ -168,6 +177,7 @@ public class MainActivity extends Activity {
         body.addView(chips());
         body.addView(actions());
         body.addView(searchBox());
+        body.addView(sortBar());
         body.addView(listCard());
         body.addView(progressArea());
         body.addView(exportButton());
@@ -191,7 +201,7 @@ public class MainActivity extends Activity {
         h.addView(t);
 
         TextView s = new TextView(this);
-        s.setText(".mdl 离线解密 · 无损 FLAC / M4A · 歌词封面内嵌");
+        s.setText(".mdl 离线解密 · 无损 FLAC / M4A / MP3 · 歌词封面内嵌");
         s.setTextColor(SUB);
         s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         s.setPadding(0, dp(2), 0, 0);
@@ -384,6 +394,7 @@ public class MainActivity extends Activity {
         r.setPadding(0, 0, 0, dp(8));
 
         TextView scan = pill("扫描曲目", ACCENT, WHITE, true);
+        scanBtn = scan;
         scan.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 if (busy) { append("任务进行中，请稍候 …"); return; }
@@ -469,6 +480,72 @@ public class MainActivity extends Activity {
         return c;
     }
 
+    private View sortBar() {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(dp(2), 0, dp(2), dp(8));
+
+        TextView label = new TextView(this);
+        label.setText("排序");
+        label.setTextColor(SUB);
+        label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        llp.rightMargin = dp(8);
+        r.addView(label, llp);
+
+        sortAlphaBtn = sortPill(r, Exporter.SORT_ALPHA);
+        sortSizeBtn = sortPill(r, Exporter.SORT_SIZE);
+        sortTimeBtn = sortPill(r, Exporter.SORT_TIME);
+        refreshSortBar();
+        return r;
+    }
+
+    private TextView sortPill(LinearLayout p, final int mode) {
+        TextView t = new TextView(this);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(dp(10), dp(4), dp(10), dp(4));
+        t.setClickable(true);
+        t.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { onSortClick(mode); }
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.rightMargin = dp(8);
+        p.addView(t, lp);
+        return t;
+    }
+
+    private void onSortClick(int mode) {
+        if (sortMode == mode) {
+            sortAsc = !sortAsc;
+        } else {
+            sortMode = mode;
+            sortAsc = (mode == Exporter.SORT_ALPHA);
+        }
+        Exporter.setSortMode(this, sortMode);
+        Exporter.setSortAsc(this, sortAsc);
+        refreshSortBar();
+        applyFilter();
+        refreshChips();
+    }
+
+    private void refreshSortBar() {
+        styleSortPill(sortAlphaBtn, "字母", Exporter.SORT_ALPHA);
+        styleSortPill(sortSizeBtn, "大小", Exporter.SORT_SIZE);
+        styleSortPill(sortTimeBtn, "时间", Exporter.SORT_TIME);
+    }
+
+    private void styleSortPill(TextView t, String name, int mode) {
+        if (t == null) return;
+        boolean active = (sortMode == mode);
+        t.setText(active ? (name + (sortAsc ? " ↑" : " ↓")) : name);
+        t.setTextColor(active ? ACCENT : SUB);
+        t.setBackground(round(active ? alphaOf(ACCENT, 0.14f) : FILL, 100));
+    }
+
     private View listCard() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -488,7 +565,6 @@ public class MainActivity extends Activity {
         list.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
                 Exporter.Item it = rows.get(pos);
-                if (!it.exportable()) { append("「" + it.display() + "」不可导出：" + it.state()); return; }
                 it.selected = !it.selected;
                 adapter.notifyDataSetChanged();
                 refreshChips();
@@ -517,6 +593,9 @@ public class MainActivity extends Activity {
         bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         bar.setMax(100);
         bar.setProgressDrawable(progressDrawable());
+        try {
+            bar.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        } catch (Throwable ignore) { }
         bar.setVisibility(View.GONE);
         c.addView(bar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(4)));
@@ -544,6 +623,29 @@ public class MainActivity extends Activity {
     }
 
     private View exportButton() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.topMargin = dp(8);
+        rlp.bottomMargin = dp(4);
+        row.setLayoutParams(rlp);
+
+        TextView del = pill("删除", alphaOf(DANGERBG, 0.5f), alphaOf(DANGER, 0.45f), true);
+        del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        del.setPadding(0, dp(11), 0, dp(11));
+        del.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (busy) { append("任务进行中，请稍候 …"); return; }
+                confirmDelete();
+            }
+        });
+        deleteBtn = del;
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 0.42f);
+        dlp.rightMargin = dp(8);
+        row.addView(del, dlp);
+
         TextView t = pill("导出选中", alphaOf(ACCENT, 0.45f), WHITE, true);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         t.setPadding(0, dp(11), 0, dp(11));
@@ -554,12 +656,9 @@ public class MainActivity extends Activity {
             }
         });
         exportBtn = t;
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(8);
-        lp.bottomMargin = dp(4);
-        t.setLayoutParams(lp);
-        return t;
+        row.addView(t, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return row;
     }
 
     private View logArea() {
@@ -692,17 +791,22 @@ public class MainActivity extends Activity {
             Exporter.Item it = rows.get(pos);
             boolean exp = it.exportable();
             h.title.setText(it.display());
-            h.sub.setText(it.subtitle());
+            String subText = it.subtitle();
+            if (sortMode == Exporter.SORT_TIME) {
+                String tt = it.timeText();
+                if (!tt.isEmpty()) subText = subText + " · " + tt;
+            }
+            h.sub.setText(subText);
             h.badge.setText(it.badge());
 
-            boolean on = it.selected && exp;
+            boolean on = it.selected;
             h.check.setText(on ? "✓" : "");
             h.check.setBackground(on ? round(ACCENT, 100) : ring(LINE, dp(1), 100));
             h.check.setTextColor(WHITE);
-            h.check.setAlpha(exp ? 1f : 0.4f);
+            h.check.setAlpha((exp || on) ? 1f : 0.4f);
 
             String st = it.state();
-            h.state.setText(st);
+            h.state.setText(it.sizeText() + " · " + st);
             if ("可导出".equals(st)) {
                 h.badge.setTextColor(OK);
                 h.badge.setBackground(round(OKBG, 8));
@@ -721,7 +825,6 @@ public class MainActivity extends Activity {
             h.sub.setAlpha(a);
             h.badge.setAlpha(a);
             h.state.setAlpha(a);
-            if (!exp) h.sub.setText(it.subtitle());
 
             View content = ((LinearLayout) cv).getChildAt(0);
             content.setBackgroundColor(on ? alphaOf(ACCENT, dark ? 0.13f : 0.07f) : Color.TRANSPARENT);
@@ -737,6 +840,15 @@ public class MainActivity extends Activity {
     private void doScan(final boolean thenExportAll) {
         if (busy) return;
         busy = true;
+        setBusyUi(true, "扫描中…");
+        setProgress(0, 0, "正在准备扫描 …");
+        runOnUiThread(new Runnable() {
+            public void run() {
+                if (rows.isEmpty() && emptyHint != null) {
+                    emptyHint.setText("正在扫描汽水音乐缓存，请稍候 …");
+                }
+            }
+        });
         new Thread(new Runnable() {
             public void run() {
                 try {
@@ -748,7 +860,10 @@ public class MainActivity extends Activity {
                     runOnUiThread(new Runnable() {
                         public void run() {
                             session = s;
-                            if (s.error != null && emptyHint != null) emptyHint.setText(s.error);
+                            if (emptyHint != null) {
+                                if (s.error != null) emptyHint.setText(s.error);
+                                else emptyHint.setText("没有符合条件的曲目");
+                            }
                             applyFilter();
                             refreshChips();
                         }
@@ -767,6 +882,7 @@ public class MainActivity extends Activity {
                     append("扫描异常: " + t);
                 } finally {
                     busy = false;
+                    setBusyUi(false, null);
                     hideProgress();
                     refreshStatus();
                     runOnUiThread(new Runnable() {
@@ -788,6 +904,8 @@ public class MainActivity extends Activity {
         List<Exporter.Item> chosen = s.selectedExportable();
         if (chosen.isEmpty()) { append("没有勾选任何可导出的曲目"); return; }
         busy = true;
+        setBusyUi(true, "导出中…");
+        setProgress(0, 0, "正在准备导出 …");
         new Thread(new Runnable() { public void run() { doExportInternal(s); } }, "export").start();
     }
 
@@ -807,52 +925,152 @@ public class MainActivity extends Activity {
             append("导出异常: " + t);
         } finally {
             busy = false;
+            setBusyUi(false, null);
             hideProgress();
             runOnUiThread(new Runnable() { public void run() { refreshChips(); } });
             refreshStatus();
         }
     }
 
+    private void confirmDelete() {
+        if (busy) return;
+        final Exporter.Session s = session;
+        if (s == null || s.error != null) {
+            append("还没有列表，请先扫描");
+            return;
+        }
+        final List<Exporter.Item> chosen = s.selectedAll();
+        if (chosen.isEmpty()) {
+            append("请先勾选要删除的曲目");
+            return;
+        }
+        long totalBytes = 0;
+        int expCount = 0;
+        for (Exporter.Item it : chosen) {
+            totalBytes += it.size;
+            if (it.exported) expCount++;
+        }
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(10), dp(20), 0);
+
+        TextView msg = new TextView(this);
+        msg.setText("将删除汽水音乐本地缓存中的 " + chosen.size()
+                + " 个 .mdl 及伴生配置（约释放 " + Exporter.Item.formatSize(totalBytes)
+                + "），此操作不可恢复。");
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        box.addView(msg);
+
+        final android.widget.CheckBox cb = new android.widget.CheckBox(this);
+        if (expCount > 0) {
+            cb.setText("同时删除已导出的音频（" + Exporter.REL + "/ 中 " + expCount + " 首）");
+            cb.setChecked(false);
+            cb.setPadding(0, dp(10), 0, 0);
+            box.addView(cb);
+        }
+
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("删除选中的 " + chosen.size() + " 首音乐")
+                .setView(box)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("确认删除", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        doDeleteInternal(s, chosen, cb.isChecked());
+                    }
+                })
+                .show();
+    }
+
+    private void doDeleteInternal(final Exporter.Session s, final List<Exporter.Item> chosen,
+                                  final boolean alsoDeleteExported) {
+        if (busy) return;
+        busy = true;
+        setBusyUi(true, "删除中…");
+        setProgress(0, 0, "正在删除 " + chosen.size() + " 首缓存 …");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    Exporter.deleteSelected(s, chosen, alsoDeleteExported,
+                            new Exporter.Log() { public void line(String x) { append(x); } },
+                            new Exporter.Progress() {
+                                public void on(int d, int t, String l) { setProgress(d, t, l); }
+                            });
+                } catch (Throwable t) {
+                    append("删除异常: " + t);
+                } finally {
+                    busy = false;
+                    setBusyUi(false, null);
+                    hideProgress();
+                    runOnUiThread(new Runnable() {
+                        public void run() {
+                            applyFilter();
+                            refreshChips();
+                        }
+                    });
+                    refreshStatus();
+                }
+            }
+        }, "delete").start();
+    }
+
     private void pickAll(boolean v) {
-        for (Exporter.Item it : rows) if (it.exportable()) it.selected = v;
+        if (!v) {
+            for (Exporter.Item it : rows) it.selected = false;
+        } else {
+            boolean anyExp = false;
+            for (Exporter.Item it : rows) if (it.exportable()) { anyExp = true; break; }
+            for (Exporter.Item it : rows) {
+                if (!anyExp || it.exportable()) it.selected = true;
+            }
+        }
         adapter.notifyDataSetChanged();
         refreshChips();
     }
 
     private void pickInvert() {
-        for (Exporter.Item it : rows) if (it.exportable()) it.selected = !it.selected;
+        for (Exporter.Item it : rows) {
+            if (showAll || it.exportable()) it.selected = !it.selected;
+        }
         adapter.notifyDataSetChanged();
         refreshChips();
     }
 
     // ================================================================ 状态
     private void refreshChips() {
-        int ready = 0, picked = 0, all = 0;
+        int ready = 0, picked = 0, pickedAll = 0, all = 0;
+        long pickedBytes = 0;
         if (session != null) all = session.items.size();
         for (Exporter.Item it : rows) {
             if (it.exportable()) ready++;
-            if (it.selected && it.exportable()) picked++;
+            if (it.selected) {
+                pickedAll++;
+                if (it.exportable()) {
+                    picked++;
+                    pickedBytes += it.size;
+                }
+            }
         }
         chipTotal.setText(showAll ? ("共 " + all) : ("可操作 " + rows.size() + "/" + all));
         chipReady.setText("可导出 " + ready);
-        chipPicked.setText("已选 " + picked);
+        chipPicked.setText("已选 " + pickedAll);
         if (chipFilter != null) {
             chipFilter.setText(showAll ? "显示全部" : "仅可操作");
         }
+        if (deleteBtn != null) {
+            deleteBtn.setText(pickedAll > 0 ? ("删除 (" + pickedAll + ")") : "删除");
+            deleteBtn.setTextColor(pickedAll > 0 ? DANGER : alphaOf(DANGER, 0.45f));
+            deleteBtn.setBackground(round(pickedAll > 0 ? DANGERBG : alphaOf(DANGERBG, 0.5f), 100));
+        }
         if (exportBtn != null) {
             TextView b = (TextView) exportBtn;
-            b.setText(picked > 0 ? "导出选中（" + picked + " 首）" : "导出选中");
+            b.setText(picked > 0
+                    ? ("导出选中（" + picked + " 首 · " + Exporter.Item.formatSize(pickedBytes) + "）")
+                    : "导出选中");
             b.setBackground(round(picked > 0 ? ACCENT : alphaOf(ACCENT, 0.45f), 100));
         }
     }
 
-    /**
-     * 按当前筛选把 session 里的条目填进列表。
-     *
-     * 默认**只显示能操作的**（可导出 / 已导出）。原因：汽水音乐里大量 `.mdl` 是
-     * 分块下载没下完的残片，它们连本地缓存的元数据都没有（显示成「未知曲目」），
-     * 而且永远导不出来 —— 全列出来只会把真正能用的那几十首淹掉。
-     */
     private void applyFilter() {
         if (session == null) return;
         rows.clear();
@@ -864,6 +1082,34 @@ public class MainActivity extends Activity {
             }
             rows.add(it);
         }
+        final java.text.Collator coll = java.text.Collator.getInstance(java.util.Locale.CHINA);
+        coll.setStrength(java.text.Collator.PRIMARY);
+        final int mode = sortMode;
+        final boolean asc = sortAsc;
+        java.util.Collections.sort(rows, new java.util.Comparator<Exporter.Item>() {
+            public int compare(Exporter.Item a, Exporter.Item b) {
+                int c;
+                if (mode == Exporter.SORT_SIZE) {
+                    c = Long.compare(a.size, b.size);
+                    if (c == 0) c = cmpAlpha(a, b);
+                } else if (mode == Exporter.SORT_TIME) {
+                    c = Long.compare(a.mtimeMs, b.mtimeMs);
+                    if (c == 0) c = cmpAlpha(a, b);
+                } else {
+                    c = cmpAlpha(a, b);
+                }
+                return asc ? c : -c;
+            }
+            private int cmpAlpha(Exporter.Item a, Exporter.Item b) {
+                int c = coll.compare(a.display(), b.display());
+                if (c != 0) return c;
+                String aa = a.artist == null ? "" : a.artist;
+                String ba = b.artist == null ? "" : b.artist;
+                c = coll.compare(aa, ba);
+                if (c != 0) return c;
+                return a.md5.compareTo(b.md5);
+            }
+        });
         if (adapter != null) adapter.notifyDataSetChanged();
         boolean empty = rows.isEmpty();
         if (list != null) list.setVisibility(empty ? View.GONE : View.VISIBLE);
@@ -899,14 +1145,31 @@ public class MainActivity extends Activity {
         }, "status").start();
     }
 
+    private void setBusyUi(final boolean isBusy, final String btnLabel) {
+        runOnUiThread(new Runnable() {
+            public void run() {
+                if (scanBtn != null) {
+                    scanBtn.setText(isBusy ? (btnLabel == null ? "处理中…" : btnLabel) : "扫描曲目");
+                    scanBtn.setBackground(round(isBusy ? alphaOf(ACCENT, 0.55f) : ACCENT, 100));
+                }
+            }
+        });
+    }
+
     private void setProgress(final int d, final int t, final String label) {
         runOnUiThread(new Runnable() {
             public void run() {
                 bar.setVisibility(View.VISIBLE);
                 progressText.setVisibility(View.VISIBLE);
-                bar.setMax(Math.max(1, t));
-                bar.setProgress(d);
-                progressText.setText(d + " / " + t + "   " + (label == null ? "" : label));
+                if (t <= 0) {
+                    bar.setIndeterminate(true);
+                    progressText.setText(label == null ? "" : label);
+                } else {
+                    bar.setIndeterminate(false);
+                    bar.setMax(t);
+                    bar.setProgress(d);
+                    progressText.setText(d + " / " + t + "   " + (label == null ? "" : label));
+                }
             }
         });
     }

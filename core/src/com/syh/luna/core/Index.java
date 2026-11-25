@@ -65,9 +65,28 @@ public final class Index {
     }
 
     public static byte[] readBytes(File f) throws IOException {
+        long len = f.length();
         InputStream in = new FileInputStream(f);
         try {
-            return readBytes(in, (int) Math.min(Integer.MAX_VALUE, f.length()));
+            if (len > 0 && len <= Integer.MAX_VALUE) {
+                int cap = (int) len;
+                byte[] buf = new byte[cap];
+                int n = 0;
+                while (n < cap) {
+                    int r = in.read(buf, n, cap - n);
+                    if (r < 0) return java.util.Arrays.copyOf(buf, n);
+                    n += r;
+                }
+                int extra = in.read();
+                if (extra < 0) return buf;
+                byte[] rest = readBytes(in, 65536);
+                byte[] out = new byte[cap + 1 + rest.length];
+                System.arraycopy(buf, 0, out, 0, cap);
+                out[cap] = (byte) extra;
+                System.arraycopy(rest, 0, out, cap + 1, rest.length);
+                return out;
+            }
+            return readBytes(in, (int) Math.min(Integer.MAX_VALUE, len));
         } finally {
             try { in.close(); } catch (IOException ignore) { }
         }
@@ -110,6 +129,13 @@ public final class Index {
         public String vid;
     }
 
+    public static String vidFromName(String md5) {
+        if (md5 != null && md5.startsWith("fileid") && md5.length() > 10) {
+            return md5.substring(6);
+        }
+        return null;
+    }
+
     public KeyHit lookupKey(byte[] b, String md5) {
         KeyHit h = new KeyHit();
         h.kid = Mp4.kidHex(b);
@@ -129,6 +155,13 @@ public final class Index {
                 }
             }
         }
+        String fv = vidFromName(md5);
+        if (fv != null && vid2spade.containsKey(fv)) {
+            h.spade = vid2spade.get(fv);
+            h.src = "vid:" + fv;
+            h.vid = fv;
+            return h;
+        }
         return h;
     }
 
@@ -140,7 +173,17 @@ public final class Index {
     public MetaHit fullMeta(String md5, String vid) {
         MetaHit h = new MetaHit();
         List<String[]> lst = md5toVid.get(md5);
-        if (vid == null && lst != null && !lst.isEmpty()) vid = lst.get(0)[0];
+        if (vid == null && lst != null && !lst.isEmpty()) {
+            for (String[] pair : lst) {
+                Map<String, Object> cand = vidMeta.get(pair[0]);
+                if (cand != null && Json.str(cand, "title") != null) {
+                    vid = pair[0];
+                    break;
+                }
+            }
+            if (vid == null) vid = lst.get(0)[0];
+        }
+        if (vid == null) vid = vidFromName(md5);
         h.vid = vid;
         if (vid != null) {
             Map<String, Object> m = vidMeta.get(vid);
@@ -281,6 +324,8 @@ public final class Index {
     }
 
     public static String coverUrl(Map<String, Object> cov, String spec) {
+        String direct = Json.str(cov, "direct_url");
+        if (direct != null && !direct.isEmpty()) return direct;
         List<Object> urls = Json.asList(cov.get("urls"));
         String base = (urls != null && !urls.isEmpty())
                 ? Json.str(urls.get(0)) : "https://p3-luna.douyinpic.com/img/";

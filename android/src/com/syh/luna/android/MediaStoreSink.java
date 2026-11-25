@@ -43,6 +43,7 @@ public final class MediaStoreSink implements Pipeline.Sink {
         //    octet-stream 没有标准扩展名，原样保留。
         if (lower.endsWith(".lrc")) return putFile(fileName, data, "application/octet-stream", true);
         if (lower.endsWith(".flac")) return putAudio(fileName, data, "audio/flac");
+        if (lower.endsWith(".mp3")) return putAudio(fileName, data, "audio/mpeg");
         if (lower.endsWith(".m4a")) return putAudio(fileName, data, "audio/mp4");
         // 报告/日志：固定放 Download/<leaf>/（共享存储里非媒体文件的稳定可写位置）
         return putFile(fileName, data, "application/octet-stream", false);

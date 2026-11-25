@@ -435,4 +435,86 @@ public final class Tags {
         }
         return buf;
     }
+
+    // ================================================================ MP3 (ID3v2.4)
+    private static void writeSynchsafe(byte[] dst, int off, int val) {
+        dst[off] = (byte) ((val >> 21) & 0x7F);
+        dst[off + 1] = (byte) ((val >> 14) & 0x7F);
+        dst[off + 2] = (byte) ((val >> 7) & 0x7F);
+        dst[off + 3] = (byte) (val & 0x7F);
+    }
+
+    private static void id3Frame(ByteArrayOutputStream o, String id, byte[] body) {
+        if (body == null || body.length == 0) return;
+        try {
+            o.write(id.getBytes(StandardCharsets.ISO_8859_1));
+            byte[] hdr = new byte[6];
+            writeSynchsafe(hdr, 0, body.length);
+            o.write(hdr);
+            o.write(body);
+        } catch (Exception ignore) { }
+    }
+
+    private static void id3TextFrame(ByteArrayOutputStream o, String id, String text) {
+        if (text == null || text.isEmpty()) return;
+        byte[] tb = text.getBytes(StandardCharsets.UTF_8);
+        byte[] body = new byte[1 + tb.length];
+        body[0] = 0x03;
+        System.arraycopy(tb, 0, body, 1, tb.length);
+        id3Frame(o, id, body);
+    }
+
+    public static byte[] mp3Embed(byte[] mp3, Map<String, String> tagsIn, byte[] cover) {
+        if (mp3 == null || mp3.length == 0) return mp3;
+        int audioOff = 0;
+        if (mp3.length >= 10 && mp3[0] == 'I' && mp3[1] == 'D' && mp3[2] == '3') {
+            int sz = ((mp3[6] & 0x7F) << 21) | ((mp3[7] & 0x7F) << 14)
+                    | ((mp3[8] & 0x7F) << 7) | (mp3[9] & 0x7F);
+            int end = 10 + sz + (((mp3[5] & 0x10) != 0) ? 10 : 0);
+            if (end > 0 && end <= mp3.length) audioOff = end;
+        }
+
+        Map<String, String> t = normTags(tagsIn);
+        ByteArrayOutputStream frames = new ByteArrayOutputStream(1024);
+        id3TextFrame(frames, "TIT2", tag(t, "title", null));
+        id3TextFrame(frames, "TPE1", tag(t, "artist", null));
+        id3TextFrame(frames, "TALB", tag(t, "album", null));
+        id3TextFrame(frames, "TSSE", TOOL);
+
+        String lyrics = tag(t, "lyrics", null);
+        if (lyrics != null && !lyrics.isEmpty()) {
+            byte[] lb = lyrics.getBytes(StandardCharsets.UTF_8);
+            byte[] body = new byte[5 + lb.length];
+            body[0] = 0x03;
+            body[1] = 'e'; body[2] = 'n'; body[3] = 'g';
+            body[4] = 0x00;
+            System.arraycopy(lb, 0, body, 5, lb.length);
+            id3Frame(frames, "USLT", body);
+        }
+
+        if (cover != null && cover.length > 0) {
+            Object[] ii = imageInfo(cover);
+            byte[] mb = ((String) ii[0]).getBytes(StandardCharsets.US_ASCII);
+            byte[] body = new byte[1 + mb.length + 1 + 1 + 1 + cover.length];
+            int w = 0;
+            body[w++] = 0x03;
+            System.arraycopy(mb, 0, body, w, mb.length);
+            w += mb.length;
+            body[w++] = 0x00;
+            body[w++] = 0x03;   // Front Cover
+            body[w++] = 0x00;
+            System.arraycopy(cover, 0, body, w, cover.length);
+            id3Frame(frames, "APIC", body);
+        }
+
+        byte[] fb = frames.toByteArray();
+        int framesLen = mp3.length - audioOff;
+        byte[] out = new byte[10 + fb.length + framesLen];
+        out[0] = 'I'; out[1] = 'D'; out[2] = '3';
+        out[3] = 0x04; out[4] = 0x00; out[5] = 0x00;
+        writeSynchsafe(out, 6, fb.length);
+        System.arraycopy(fb, 0, out, 10, fb.length);
+        System.arraycopy(mp3, audioOff, out, 10 + fb.length, framesLen);
+        return out;
+    }
 }

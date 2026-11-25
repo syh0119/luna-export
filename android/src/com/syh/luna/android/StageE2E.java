@@ -58,19 +58,31 @@ public final class StageE2E {
         InputStream stdout = p.getInputStream();
 
         // ---- App 侧：读到标记为止，其余当 tar 流解包
-        StringBuilder head = new StringBuilder();
+        ByteArrayOutputStream headBytes = new ByteArrayOutputStream();
         int ch;
         boolean found = false;
+        byte[] mark = StageCmd.TAR_BEGIN.getBytes("UTF-8");
         while ((ch = stdout.read()) >= 0) {
-            head.append((char) ch);
-            if (head.length() > 8192) break;
-            String h = head.toString();
-            int bi = h.indexOf(StageCmd.TAR_BEGIN);
-            if (bi >= 0) { found = true; head.setLength(bi); break; }
+            headBytes.write(ch);
+            if (headBytes.size() > 65536) break;
+            byte[] cur = headBytes.toByteArray();
+            if (cur.length >= mark.length) {
+                boolean match = true;
+                for (int i = 0; i < mark.length; i++) {
+                    if (cur[cur.length - mark.length + i] != mark[i]) { match = false; break; }
+                }
+                if (match) {
+                    found = true;
+                    headBytes.reset();
+                    headBytes.write(cur, 0, cur.length - mark.length);
+                    break;
+                }
+            }
         }
+        String text = new String(headBytes.toByteArray(), "UTF-8");
         fail += check("stdout 里能找到 tar 流标记", found);
         if (!found) {
-            System.out.println("  su 输出: " + head);
+            System.out.println("  su 输出: " + text);
             // 把 stderr 也读出来 —— 命令失败时只有 stderr 有信息
             try {
                 byte[] eb = new byte[8192];
@@ -80,7 +92,6 @@ public final class StageE2E {
             System.out.println("  实际命令: " + cmd);
             System.exit(1);
         }
-        String text = head.toString();
         fail += check("诊断里有 LUNA_BASE", text.contains("LUNA_BASE="));
         fail += check("诊断里有 LUNA_LIST", text.contains("LUNA_LIST="));
         System.out.println("  su 文本诊断:\n    " + text.trim().replace("\n", "\n    "));
@@ -88,23 +99,46 @@ public final class StageE2E {
         // ---- 解包
         File dest = new File(appFiles, "luna_stage");
         dest.mkdirs();
-        Tar.Result r = Tar.extract(stdout, dest, StageCmd.SUB);
+        Tar.Result r = Tar.extract(stdout, dest, StageCmd.META_SUB);
         int rc = p.waitFor();
         fail += check("su 退出码 0", rc == 0);
-        fail += check("解出 6 个文件", r.files == 6);
-        // 目录条目：中间层（files/、cache/）不在 SUB 清单里 → 被跳过（设计如此）；
+        fail += check("解出 3 个元数据文件（不含 files/music）", r.files == 3);
+        // 目录条目：中间层（files/、cache/）不在 META_SUB 清单里 → 被跳过（设计如此）；
         // 真正建出来的只有扁平后的顶层目录
         fail += check("目录数合理（>=1，中间层被跳过是设计）", r.dirs >= 1);
 
         // ---- 校验落点
-        fail += check("files_music/a.mdl", new File(dest, "files_music/a.mdl").isFile());
-        fail += check("files_music/b.mdl", new File(dest, "files_music/b.mdl").isFile());
-        fail += check("files_music/中文名.mdl", new File(dest, "files_music/中文名.mdl").isFile());
+        fail += check("LUNA_MDL 清单含 a.mdl", text.contains(":a.mdl"));
+        fail += check("LUNA_MDL 清单含 中文名.mdl", text.contains(":中文名.mdl"));
+        fail += check("★files_music 未被搬运到暂存区", !new File(dest, "files_music").exists());
         fail += check("databases/player.db", new File(dest, "databases/player.db").isFile());
         fail += check("cache_NetCacheLoader/c.json", new File(dest, "cache_NetCacheLoader/c.json").isFile());
         fail += check("files_keva/k.sgv", new File(dest, "files_keva/k.sgv").isFile());
-        fail += check("内容正确 a.mdl",
-                "MDL-A".equals(read(new File(dest, "files_music/a.mdl"))));
+
+        // ---- 验证批量读头与按需单文件读取
+        String hp = host.getAbsolutePath().replace('\\', '/');
+        String hcmd = StageCmd.buildReadHeadBatch(hp, Arrays.asList("a.mdl", "b.mdl", "中文名.mdl"), 64);
+        ProcessBuilder hpb = new ProcessBuilder(findSh(), "-c", hcmd);
+        hpb.redirectErrorStream(false);
+        Process hpProc = hpb.start();
+        byte[] hAll = readAllBytes(hpProc.getInputStream());
+        int hrc = hpProc.waitFor();
+        String hStr = new String(hAll, "UTF-8");
+        fail += check("批量读头退出码 0", hrc == 0);
+        fail += check("批量读头含 LUNA_HEAD_BEGIN 与 MDL-A/MDL-B/CN",
+                hStr.contains("LUNA_HEAD_BEGIN") && hStr.contains("MDL-A")
+                        && hStr.contains("MDL-B") && hStr.contains("CN"));
+
+        String fcmd = StageCmd.buildReadFile(hp, "b.mdl");
+        ProcessBuilder fpb = new ProcessBuilder(findSh(), "-c", fcmd);
+        fpb.redirectErrorStream(false);
+        Process fpProc = fpb.start();
+        byte[] fAll = readAllBytes(fpProc.getInputStream());
+        int frc = fpProc.waitFor();
+        String fStr = new String(fAll, "UTF-8");
+        fail += check("单文件流读退出码 0", frc == 0);
+        fail += check("单文件流读含 LUNA_FILE_BEGIN 与 MDL-B",
+                fStr.equals(StageCmd.FILE_BEGIN + "MDL-B"));
 
         // ---- 关键：宿主目录没被改过（su 只读）
         fail += check("宿主目录没被写入", !new File(host, "luna_stage").exists());
@@ -112,7 +146,7 @@ public final class StageE2E {
                 new File(host, "files/music").list().length == 3);
 
         // ---- App 目录里的文件属主就是当前用户（App 自己创建）
-        File f = new File(dest, "files_music/a.mdl");
+        File f = new File(dest, "databases/player.db");
         fail += check("解包文件可读", f.canRead());
         fail += check("解包文件属主=当前用户",
                 f.getAbsolutePath().length() > 0 && ownerReadable(f));
@@ -139,8 +173,14 @@ public final class StageE2E {
         sb.append("if [ -z \"$BASE\" ]; then echo 'LUNA_NO_BASE'; exit 7; fi; ");
         sb.append("echo \"LUNA_BASE=$BASE\"; ");
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
+        sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
+        sb.append("for f in *.mdl *.MDL; do ");
+        sb.append("[ -f \"$f\" ] || continue; ");
+        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
+        sb.append("done; fi; ");
         sb.append("set --; ");
-        for (String sub : StageCmd.SUB) {
+        for (String sub : StageCmd.META_SUB) {
             sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then set -- \"$@\" ")
               .append(sub).append("; fi; ");
         }
@@ -166,6 +206,14 @@ public final class StageE2E {
             return "sh.exe";
         }
         return "/bin/sh";
+    }
+
+    static byte[] readAllBytes(InputStream in) throws Exception {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        byte[] b = new byte[4096];
+        int n;
+        while ((n = in.read(b)) > 0) o.write(b, 0, n);
+        return o.toByteArray();
     }
 
     static boolean ownerReadable(File f) {

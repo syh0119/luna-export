@@ -21,7 +21,7 @@ import java.util.regex.Pattern;
 public final class Scanner {
 
     public static final Pattern RE_MD5KEY =
-            Pattern.compile("^(v[0-9a-zA-Z]{10,})\\|([^|]*)\\|([0-9a-f]{32})$");
+            Pattern.compile("^(v[0-9a-zA-Z]{10,})\\|([^|]*)\\|([0-9a-f]{32}|fileid[0-9a-zA-Z_-]+)$");
     private static final Pattern RE_JSON_START = Pattern.compile("[\\{\\[]");
     /** 32 位十六进制 —— 宿主用 file_hash 表示 .mdl 的文件名 */
     private static final Pattern RE_MD5 = Pattern.compile("^[0-9a-fA-F]{32}$");
@@ -31,8 +31,10 @@ public final class Scanner {
 
     /** 当前 blob 里出现过的 `file_hash`（就是 .mdl 的文件名） */
     private final List<String> curHashes = new ArrayList<String>();
-    /** 当前 blob 里出现过的 track vid */
+    /** 当前 blob 里出现过的 track/video vid */
     private final List<String> curVids = new ArrayList<String>();
+    /** 当前 blob 里 cache_load_records 出现过的音频轨 vid */
+    private final List<String> curCacheVids = new ArrayList<String>();
 
     public int blobCount;
     public int jsonCount;
@@ -79,6 +81,7 @@ public final class Scanner {
         blobCount++;
         curHashes.clear();
         curVids.clear();
+        curCacheVids.clear();
         scanText(b);
 
         // 宿主的 `playableJson` 里**嵌着被转义的 JSON**：
@@ -119,12 +122,22 @@ public final class Scanner {
      * 只在**恰好一个 vid** 时才关联（有歌单混进来时宁可不做，也别连错）。
      */
     private void linkHashes() {
-        if (curHashes.isEmpty() || curVids.size() != 1) return;
+        if (curVids.size() != 1) return;
         String vid = curVids.get(0);
         for (String h : curHashes) {
             Set<String> set = md5sets.get(h);
             if (set == null) { set = new LinkedHashSet<String>(); md5sets.put(h, set); }
             set.add(vid + "\u0000" + "lossless");
+        }
+        Map<String, Object> mainMeta = idx.vidMeta.get(vid);
+        if (mainMeta != null && !mainMeta.isEmpty()) {
+            for (String cv : curCacheVids) {
+                if (cv.equals(vid)) continue;
+                Map<String, Object> ex = idx.vidMeta.get(cv);
+                if (ex == null || Json.str(ex, "title") == null) {
+                    idx.vidMeta.put(cv, mainMeta);
+                }
+            }
         }
     }
 
@@ -153,6 +166,7 @@ public final class Scanner {
                 noteEncrypt(Json.asMap(m.get("encrypt_info")), Json.str(m, "video_id"));
             if (m.get("spade_a") instanceof String) noteEncrypt(m, null);
             if (m.get("track") instanceof Map) noteTrack((Map<String, Object>) m.get("track"));
+            if (m.get("video") instanceof Map) noteVideo((Map<String, Object>) m.get("video"));
             if (m.containsKey("video_list")) noteVideoModel(m, null);
             // file_hash = .mdl 的文件名；和同一条记录里的 track 关联后就能补出 md5→vid
             Object fh = m.get("file_hash");
@@ -164,6 +178,8 @@ public final class Scanner {
                     Set<String> set = md5sets.get(mm.group(3));
                     if (set == null) { set = new LinkedHashSet<String>(); md5sets.put(mm.group(3), set); }
                     set.add(mm.group(1) + "\u0000" + mm.group(2));
+                    if (!curHashes.contains(mm.group(3))) curHashes.add(mm.group(3));
+                    if (!curCacheVids.contains(mm.group(1))) curCacheVids.add(mm.group(1));
                 }
                 walkJson(e.getValue(), depth + 1);
             }
@@ -249,6 +265,68 @@ public final class Scanner {
             if (vm != null && !vm.isEmpty()) {
                 Map<String, Object> v = Json.parseStrictObject(vm);
                 if (v != null) noteVideoModel(v, vid);
+            }
+        }
+    }
+
+    private void noteVideo(Map<String, Object> v) {
+        if (v == null) return;
+        String vid = Json.str(v, "vid");
+        if (vid == null || vid.isEmpty()) vid = Json.str(v, "video_id");
+        if (vid == null || vid.isEmpty()) return;
+        if (!curVids.contains(vid)) curVids.add(vid);
+        Map<String, Object> m = idx.vidMeta.get(vid);
+        if (m == null) { m = new LinkedHashMap<String, Object>(); idx.vidMeta.put(vid, m); }
+
+        String title = Json.str(v, "title");
+        if (title == null || title.isEmpty()) title = Json.str(v, "description");
+        if (title != null && !title.isEmpty()) {
+            put(m, "title", Tags.pyStrip(Tags.collapseWs(Tags.fixMojibake(title))));
+        }
+
+        List<Object> arts = Json.asList(v.get("artists"));
+        if (arts != null && !arts.isEmpty()) {
+            Map<String, Object> a0 = Json.asMap(arts.get(0));
+            if (a0 != null) {
+                String aname = Json.str(a0, "name");
+                if (aname == null || aname.isEmpty()) {
+                    Map<String, Object> ui = Json.asMap(a0.get("user_info"));
+                    if (ui != null) aname = Json.str(ui, "nickname");
+                }
+                if (aname != null && !aname.isEmpty()) {
+                    put(m, "artist", Tags.pyStrip(Tags.collapseWs(Tags.fixMojibake(aname))));
+                }
+            }
+        }
+        Map<String, Object> album = Json.asMap(v.get("album"));
+        if (album != null) {
+            String an = Json.str(album, "name");
+            if (an != null && !an.isEmpty()) put(m, "album", Tags.fixMojibake(an));
+        }
+        Object dur = v.get("duration");
+        if (dur != null) put(m, "duration", dur);
+
+        Map<String, Object> cov = Json.asMap(v.get("cover_url"));
+        if (cov == null || Json.asList(cov.get("urls")) == null || Json.asList(cov.get("urls")).isEmpty()) {
+            cov = Json.asMap(v.get("image_url"));
+        }
+        if (cov != null) {
+            List<Object> urls = Json.asList(cov.get("urls"));
+            String uri = Json.str(cov, "uri");
+            if (urls != null && !urls.isEmpty()) {
+                String u0 = Json.str(urls.get(0));
+                if (u0 != null && u0.startsWith("http")) {
+                    Map<String, Object> c = new LinkedHashMap<String, Object>();
+                    if (uri == null || uri.isEmpty() || Boolean.TRUE.equals(cov.get("need_complete_url"))) {
+                        c.put("direct_url", u0);
+                    } else {
+                        c.put("uri", uri);
+                        String tp = Json.str(cov, "template_prefix");
+                        c.put("prefix", (tp == null || tp.isEmpty()) ? "tplv-b829550vbb" : tp);
+                        c.put("urls", urls);
+                    }
+                    put(m, "cover", c);
+                }
             }
         }
     }

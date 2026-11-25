@@ -85,7 +85,9 @@ public final class CoverStore implements Pipeline.CoverProvider {
             if (d.length < 1024) return null;
             boolean jpeg = (d[0] & 0xFF) == 0xFF && (d[1] & 0xFF) == 0xD8;
             boolean png = d.length > 8 && (d[0] & 0xFF) == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G';
-            return (jpeg || png) ? d : null;
+            boolean webp = d.length > 12 && d[0] == 'R' && d[1] == 'I' && d[2] == 'F' && d[3] == 'F'
+                    && d[8] == 'W' && d[9] == 'E' && d[10] == 'B' && d[11] == 'P';
+            return (jpeg || png || webp) ? d : null;
         } catch (Throwable t) {
             return null;
         } finally {
@@ -123,8 +125,10 @@ public final class CoverStore implements Pipeline.CoverProvider {
             bm.recycle();
             byte[] out = bo.toByteArray();
             if (out.length == 0) return null;
-            // 已经很小且比原图大，就用原图
-            if (out.length >= raw.length && Math.max(w, h) <= MAX_PX) return raw;
+            // 已经很小且原本就是 JPEG/PNG 时才保留原图（WebP 必须转为 JPEG）
+            boolean keepRaw = ((raw[0] & 0xFF) == 0xFF && (raw[1] & 0xFF) == 0xD8)
+                    || (raw.length > 8 && (raw[0] & 0xFF) == 0x89 && raw[1] == 'P' && raw[2] == 'N' && raw[3] == 'G');
+            if (keepRaw && out.length >= raw.length && Math.max(w, h) <= MAX_PX) return raw;
             return out;
         } catch (Throwable t) {
             return null;

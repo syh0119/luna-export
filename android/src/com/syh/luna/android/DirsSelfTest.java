@@ -51,10 +51,43 @@ public final class DirsSelfTest {
                 tcmd.contains("set --") && tcmd.contains("\"$@\""));
         fail += check("★tar 空清单判据用 $#（字符串判据在 set -- 下无效）",
                 tcmd.contains("$# -eq 0"));
-        for (String sub : StageCmd.SUB) {
+        for (String sub : StageCmd.META_SUB) {
             fail += check("tar 清单含 " + sub, tcmd.contains("set -- \"$@\" " + sub));
         }
+        fail += check("★tar 清单不再打包 files/music（免搬运数 GB）",
+                !tcmd.contains("set -- \"$@\" files/music"));
+        fail += check("★tar 命令输出 LUNA_MDL 元清单", tcmd.contains("LUNA_MDL="));
         int sc = shellSyntax("tar 命令 sh -n 通过", tcmd);
+        if (sc >= 0) fail += sc;
+
+        // 按需单文件/批量读头命令语法与路径保护
+        String rcmd = StageCmd.buildReadFile("/data/data/com.luna.music", "abc.mdl");
+        fail += check("readFile 含 LUNA_FILE_BEGIN", rcmd.contains("LUNA_FILE_BEGIN"));
+        sc = shellSyntax("readFile 命令 sh -n 通过", rcmd);
+        if (sc >= 0) fail += sc;
+        String hcmd = StageCmd.buildReadHeadBatch("/data/data/com.luna.music",
+                Arrays.asList("a.mdl", "../evil.mdl", "b.mdl"), StageCmd.HEAD_BYTES);
+        fail += check("readHeadBatch 含 LUNA_HEAD_BEGIN", hcmd.contains("LUNA_HEAD_BEGIN"));
+        fail += check("★readHeadBatch 拒绝 ../evil.mdl", !hcmd.contains("evil.mdl"));
+        sc = shellSyntax("readHeadBatch 命令 sh -n 通过", hcmd);
+        if (sc >= 0) fail += sc;
+
+        // 删除命令白名单与路径保护
+        boolean badBaseRejected = false;
+        try {
+            StageCmd.buildDeleteMdl("/sdcard/Music", Arrays.asList("a.mdl"));
+        } catch (IllegalArgumentException e) {
+            badBaseRejected = true;
+        }
+        fail += check("★buildDeleteMdl 拒绝非白名单 base", badBaseRejected);
+        String dcmd = StageCmd.buildDeleteMdl("/data/data/com.luna.music",
+                Arrays.asList("abc.mdl", "../evil.mdl", "player.db", "*.mdl"));
+        fail += check("★buildDeleteMdl 仅用 rm -f 不用 rm -rf",
+                dcmd.contains("rm -f ") && !dcmd.contains("rm -rf"));
+        fail += check("buildDeleteMdl 同步删 .mdlnodeconf", dcmd.contains("abc.mdlnodeconf"));
+        fail += check("★buildDeleteMdl 过滤非法文件名",
+                !dcmd.contains("evil.mdl") && !dcmd.contains("player.db") && !dcmd.contains("*.mdl"));
+        sc = shellSyntax("buildDeleteMdl 命令 sh -n 通过", dcmd);
         if (sc >= 0) fail += sc;
 
         // ================= 3) cp 兜底命令构造 =================
@@ -79,17 +112,18 @@ public final class DirsSelfTest {
         fail += check("★标签提取改用 u: 前缀 token", ccmd.contains("grep '^u:'"));
         fail += check("★cp 不用 -a（会带来源 SELinux 标签）", !ccmd.contains("cp -a"));
 
-        for (String sub : StageCmd.SUB) {
-            if ("files/music".equals(sub)) continue;
+        for (String sub : StageCmd.META_SUB) {
             String flat = sub.replace('/', '_');
             fail += check("cp 清单覆盖 " + sub + " → " + flat, ccmd.contains(flat));
         }
+        fail += check("★cp 清单不再搬运 files_music", !ccmd.contains("$S/files_music"));
+        fail += check("★cp 命令输出 LUNA_MDL 元清单", ccmd.contains("LUNA_MDL="));
         sc = shellSyntax("cp 命令 sh -n 通过", ccmd);
         if (sc >= 0) fail += sc;
 
         // ================= 4) 清单一致性 =================
-        for (String sub : StageCmd.SUB) {
-            fail += check("SUB 覆盖 " + sub, tcmd.contains(sub) && ccmd.contains(sub));
+        for (String sub : StageCmd.META_SUB) {
+            fail += check("META_SUB 覆盖 " + sub, tcmd.contains(sub) && ccmd.contains(sub));
         }
         fail += check("SUB 里没有 /data/local/tmp",
                 !Arrays.toString(StageCmd.SUB).contains("/data/local/tmp"));
@@ -189,6 +223,25 @@ public final class DirsSelfTest {
             }
             fail += check("tar 拒绝 ../ 路径穿越", !new File(tmp, "escaped.txt").exists());
             fail += check("tar 路径穿越被计入 skipped", er.skipped > 0);
+
+            // ---- mtime 保留 & resync 脏前缀恢复不丢首文件
+            File srcMtime = new File(deep, "a.mdl");
+            long wantSec = 1700000000L;
+            srcMtime.setLastModified(wantSec * 1000L);
+            File tar2 = new File(tmp, "b.tar");
+            run(tarExe, new String[]{"-cf", tar2.getAbsolutePath(),
+                    "-C", src.getAbsolutePath(), "files/music/a.mdl"}, tmp);
+            byte[] tar2Bytes = java.nio.file.Files.readAllBytes(tar2.toPath());
+            byte[] dirty = new byte[17 + tar2Bytes.length];
+            for (int k = 0; k < 17; k++) dirty[k] = (byte) ('A' + k);
+            System.arraycopy(tar2Bytes, 0, dirty, 17, tar2Bytes.length);
+            File dst2 = new File(tmp, "dst2");
+            dst2.mkdirs();
+            Tar.Result rr = Tar.extract(new ByteArrayInputStream(dirty), dst2, StageCmd.SUB);
+            File outA = new File(dst2, "files_music/a.mdl");
+            fail += check("★tar resync 脏前缀后不丢首文件", rr.files == 1 && outA.isFile());
+            fail += check("★tar 恢复 mtime（保留增量指纹）",
+                    Math.abs(outA.lastModified() / 1000L - wantSec) <= 2);
         } catch (Throwable t) {
             System.out.println("  [FAIL] tar 解包测试异常: " + t);
             fail++;

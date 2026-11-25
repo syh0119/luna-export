@@ -123,12 +123,12 @@ public final class Tar {
                     r.error = "tar 头校验失败（流被污染或不是 tar）";
                     throw new IOException(r.error);
                 }
-                continue;
             }
 
             String name = cstr(h, 0, 100);
             String prefix = cstr(h, 345, 155);
             long size = num(h, 124, 12);
+            long mtime = num(h, 136, 12);
             char type = (char) (h[156] & 0xff);
 
             // GNU long name：下一个条目的真实文件名
@@ -231,6 +231,7 @@ public final class Tar {
                 // 权限：属主可读写即可（App 自己就是属主）
                 target.setReadable(true, false);
                 target.setWritable(true, false);
+                if (mtime > 0) target.setLastModified(mtime * 1000L);
                 r.files++;
                 r.bytes += size;
                 if (r.names.size() < 40) r.names.add(name);
@@ -299,8 +300,24 @@ public final class Tar {
             int b = (i >= 148 && i < 156) ? ' ' : (h[i] & 0xff);
             sum += b;
         }
-        long want = num(h, 148, 8);
-        return want < 0 || want == sum;
+        long want = octalChecksum(h);
+        return want >= 0 && want == sum && sum > 0;
+    }
+
+    static long octalChecksum(byte[] h) {
+        long v = 0;
+        boolean any = false;
+        for (int i = 148; i < 156; i++) {
+            int c = h[i] & 0xff;
+            if (c == 0 || c == ' ') {
+                if (any) break;
+                continue;
+            }
+            if (c < '0' || c > '7') return -1;
+            v = v * 8 + (c - '0');
+            any = true;
+        }
+        return any ? v : -1;
     }
 
     /** 全 0 = 归档结束 */
@@ -385,12 +402,11 @@ public final class Tar {
     /** 逐字节滑动，重新找回 tar 头同步点 */
     static boolean resync(InputStream in, byte[] h) throws IOException {
         for (int attempt = 0; attempt < 4096; attempt++) {
-            if (readFully(in, h, 512) < 512) return false;
-            if (valid(h)) return true;
             System.arraycopy(h, 1, h, 0, 511);
             int c = in.read();
             if (c < 0) return false;
             h[511] = (byte) c;
+            if (!isZero(h) && valid(h)) return true;
         }
         return false;
     }

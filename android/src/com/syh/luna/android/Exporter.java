@@ -109,6 +109,7 @@ public final class Exporter {
     // ------------------------------------------------------------------ 数据
     public static final class Item {
         public final File file;
+        public final String fileName;
         public final String md5;
         public String kind = "";
         public String title;
@@ -121,13 +122,25 @@ public final class Exporter {
         public boolean exported;      // 上次已成功导出
         public boolean changed;       // 文件自上次导出后有变化（或从未扫过）
         public long size;
+        public long mtimeMs;
         public volatile boolean selected;
 
-        Item(File f, String md5) { this.file = f; this.md5 = md5; }
+        Item(File f, String md5) {
+            this(f, f == null ? (md5 + ".mdl") : f.getName(), md5,
+                    f == null ? 0L : f.length(), f == null ? 0L : f.lastModified());
+        }
+
+        Item(File f, String fileName, String md5, long size, long mtimeMs) {
+            this.file = f;
+            this.fileName = fileName;
+            this.md5 = md5;
+            this.size = size;
+            this.mtimeMs = mtimeMs;
+        }
 
         public boolean exportable() {
             if (!complete) return false;
-            if ("plain".equals(kind)) return true;
+            if ("plain".equals(kind) || "mp3".equals(kind)) return true;
             if (!("flac".equals(kind) || "aac".equals(kind))) return false;
             return hasKey;
         }
@@ -165,6 +178,7 @@ public final class Exporter {
         public String badge() {
             if ("flac".equals(kind)) return "FLAC";
             if ("aac".equals(kind)) return "AAC";
+            if ("mp3".equals(kind)) return "MP3";
             if ("plain".equals(kind)) return "M4A";
             if ("video".equals(kind)) return "MV";
             return "?";
@@ -173,10 +187,26 @@ public final class Exporter {
         public String state() {
             if ("video".equals(kind) || "junk".equals(kind)) return "跳过";
             if (!complete) return "残片";
-            if (!"plain".equals(kind) && !hasKey) return "缺密钥";
+            if (!"plain".equals(kind) && !"mp3".equals(kind) && !hasKey) return "缺密钥";
             if (exported && !changed) return "已导出";
             if (!exported && !changed) return "待导出";
             return "可导出";
+        }
+
+        public String sizeText() {
+            return formatSize(size);
+        }
+
+        public static String formatSize(long bytes) {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1024L * 1024) return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+            if (bytes < 1024L * 1024 * 1024) return String.format(Locale.US, "%.1f MB", bytes / 1048576.0);
+            return String.format(Locale.US, "%.2f GB", bytes / 1073741824.0);
+        }
+
+        public String timeText() {
+            if (mtimeMs <= 0) return "";
+            return new SimpleDateFormat("MM-dd HH:mm", Locale.US).format(new Date(mtimeMs));
         }
     }
 
@@ -218,6 +248,12 @@ public final class Exporter {
             return out;
         }
 
+        public List<Item> selectedAll() {
+            List<Item> out = new ArrayList<Item>();
+            for (Item it : items) if (it.selected) out.add(it);
+            return out;
+        }
+
         public List<Item> autoTargets() {
             List<Item> out = new ArrayList<Item>();
             for (Item it : items) if (it.needsAutoExport()) out.add(it);
@@ -255,7 +291,16 @@ public final class Exporter {
     }
 
     static String sigOf(File f) {
-        return f.length() + ":" + f.lastModified();
+        return sigOf(f.length(), f.lastModified());
+    }
+
+    static String sigOf(long size, long mtimeMs) {
+        return size + ":" + ((mtimeMs / 1000L) * 1000L);
+    }
+
+    private static String md5OfName(String n) {
+        return n.toLowerCase(Locale.ROOT).endsWith(".mdl")
+                ? n.substring(0, n.length() - 4) : n;
     }
 
     // ------------------------------------------------------------------ 准备
@@ -264,20 +309,23 @@ public final class Exporter {
         Session s = new Session();
         s.ctx = ctx;
 
+        List<Dirs.MdlEntry> stagedEntries = null;
+        List<File> files = null;
         if (rootMode) {
+            if (prog != null) prog.on(0, 0, "检查 root 权限 …");
             if (!Dirs.hasRoot()) {
                 s.error = "未获得 root 授权（su 不可用）";
                 if (log != null) log.line("✗ " + s.error);
                 return s;
             }
-            if (log != null) log.line("su 暂存宿主私有目录 …");
+            if (log != null) log.line("su 暂存宿主元数据 …");
+            if (prog != null) prog.on(0, 0, "读取宿主元数据（不搬运音频本体）…");
             try {
                 s.root = Dirs.stage(ctx);
             } catch (Exception e) {
                 s.error = "su 暂存失败: " + e.getMessage();
                 if (log != null) {
                     log.line("✗ " + s.error);
-                    // 把 su 侧看到的原样带出来 —— 真机排障靠这个，别猜
                     if (Dirs.lastTarError != null && Dirs.lastTarError.length() > 0)
                         log.line("  tar 路径: " + Dirs.lastTarError);
                     if (Dirs.lastSuOutput != null && Dirs.lastSuOutput.length() > 0)
@@ -295,24 +343,31 @@ public final class Exporter {
             }
             s.staged = true;
             s.base = Dirs.lastBase;
+            stagedEntries = new ArrayList<Dirs.MdlEntry>(Dirs.lastMdlList);
+            if (stagedEntries.isEmpty()) {
+                Dirs.cleanup(s.root);
+                s.error = "没找到 .mdl（root 模式请确认 su 已授权且汽水音乐已有缓存）";
+                if (log != null) log.line("✗ " + s.error);
+                return s;
+            }
         } else {
             s.root = Dirs.inProcess(ctx);
             s.staged = false;
+            File mdlDir = IndexBuilder.sub(s.root, "files/music", false);
+            files = Pipeline.listMdl(mdlDir);
+            if (files.isEmpty()) {
+                s.error = "没找到 .mdl（LSPosed 模式请确认作用域已勾选并重启过宿主）";
+                if (log != null) log.line("✗ " + s.error);
+                return s;
+            }
         }
 
-        File mdlDir = IndexBuilder.sub(s.root, "files/music", s.staged);
-        List<File> files = Pipeline.listMdl(mdlDir);
-        if (files.isEmpty()) {
-            s.error = "没找到 .mdl（root 模式请确认 su 已授权；LSPosed 模式请确认作用域已勾选并重启过宿主）";
-            if (log != null) log.line("✗ " + s.error);
-            return s;
-        }
-
+        int totalCount = rootMode ? stagedEntries.size() : files.size();
         s.stateFile = stateFileFor(ctx, rootMode, s.root);
         s.state = State.load(s.stateFile);
         s.wantLrc = lrcSidecar(ctx);        // 默认 false：歌词已内嵌，不额外丢 .lrc
 
-        if (prog != null) prog.on(0, files.size(), "建立索引 …");
+        if (prog != null) prog.on(0, 0, "解析曲目与密钥索引（" + totalCount + " 个文件）…");
         Index idx = IndexBuilder.build(s.root, s.staged);
         File vault = rootMode ? KeyVault.inStage(s.root) : KeyVault.inHost(s.root);
         s.vaultKeys = KeyVault.apply(idx, vault);
@@ -320,85 +375,97 @@ public final class Exporter {
         s.indexInfo = "密钥 " + idx.kid2spade.size()
                 + " · 曲目库 " + idx.vidMeta.size()
                 + " · md5映射 " + idx.md5toVid.size();
+        // 索引建完立即清理 ~38 MB 临时元数据目录，不留宿主机密副本
+        if (s.staged) {
+            Dirs.cleanup(s.root);
+        }
 
         s.covers = new CoverStore(ctx);
         int i = 0, probed = 0;
-        for (File f : files) {
-            String n = f.getName();
-            String md5 = n.toLowerCase(Locale.ROOT).endsWith(".mdl")
-                    ? n.substring(0, n.length() - 4) : n;
-            Item it = new Item(f, md5);
-            it.size = f.length();
-            String sig = sigOf(f);
-            FileRec cached = s.state.files.get(md5);
-            if (cached != null && sig.equals(cached.sig)) {
-                // 命中缓存：完全不读文件
-                it.kind = cached.kind == null ? "" : cached.kind;
-                it.title = cached.title;
-                it.artist = cached.artist;
-                it.album = cached.album;
-                it.complete = cached.complete;
-                it.exported = cached.exported;
-                it.changed = false;
-                // hasKey 用**当前索引**按 KID 重算，不信缓存里的布尔值。
-                // 密钥库是会长大的（LSPosed 侧一直在被动抓 encrypt_info），
-                // KID 又写在文件里不会变 —— 只存布尔值的话，第一次没 key 的歌
-                // 会被永久钉死成「不可导出」，密钥补上了也还是灰的。
-                it.kid = cached.kid;
-                if (it.kid != null && !it.kid.isEmpty()) {
-                    boolean now = idx.kid2spade.containsKey(it.kid);
-                    if (now != cached.hasKey) cached.hasKey = now;
-                    it.hasKey = now;
-                } else {
-                    it.hasKey = cached.hasKey;
+
+        if (rootMode) {
+            List<String> needHeads = new ArrayList<String>();
+            for (Dirs.MdlEntry e : stagedEntries) {
+                String md5 = md5OfName(e.name);
+                String sig = sigOf(e.size, e.mtimeSec * 1000L);
+                FileRec cached = s.state.files.get(md5);
+                if (cached == null || !sig.equals(cached.sig)) {
+                    needHeads.add(e.name);
                 }
-                // 上次没解析出标题的，从**索引**里再查一次（零读盘）。
-                // 索引是会变的：LSPosed 侧被动抓取一直在往 blobs.bin 里攒，
-                // 之前查不到的歌后来可能就有了 —— 否则空标题会被缓存永久固化。
-                if (it.title == null || it.title.isEmpty()) {
-                    Index.MetaHit mh = idx.fullMeta(md5, null);
-                    String t = Json.str(mh.meta, "title");
-                    if (t != null && !t.isEmpty()) {
-                        it.title = t;
-                        it.artist = Json.str(mh.meta, "artist");
-                        it.album = Json.str(mh.meta, "album");
-                        cached.title = it.title;
-                        cached.artist = it.artist;
-                        cached.album = it.album;
-                    }
-                }
-            } else {
-                it.changed = true;
-                probed++;
-                try {
-                    Pipeline.Result r = Pipeline.process(f, null, idx, s.covers, true, true, true);
-                    it.kind = r.kind;
-                    it.title = r.title;
-                    it.artist = r.artist;
-                    it.album = r.album;
-                    it.complete = r.complete;
-                    it.hasKey = isKey(r);
-                    it.kid = r.kid;
-                } catch (Throwable t) {
-                    it.kind = "junk";
-                }
-                if (cached == null) s.newCount++;
-                // 把探测结果写回缓存 —— 否则下次扫描 sig 对不上还要重读一遍，
-                // 而且 kid / hasKey 永远存不下来（缓存路径就永远重算不了）
-                FileRec rec = s.state.files.get(md5);
-                if (rec == null) { rec = new FileRec(); s.state.files.put(md5, rec); }
-                rec.sig = sig;
-                rec.kind = it.kind;
-                rec.title = it.title;
-                rec.artist = it.artist;
-                rec.album = it.album;
-                rec.kid = it.kid;
-                rec.complete = it.complete;
-                rec.hasKey = it.hasKey;
             }
-            s.items.add(it);
-            i++;
-            if (prog != null) prog.on(i, files.size(), "扫描 " + i + "/" + files.size());
+            if (!needHeads.isEmpty() && prog != null) {
+                prog.on(0, 0, "读取 " + needHeads.size() + " 首新曲目头部 …");
+            }
+            Map<String, byte[]> heads = needHeads.isEmpty()
+                    ? java.util.Collections.<String, byte[]>emptyMap()
+                    : Dirs.readHostMdlHeads(s.base, needHeads, StageCmd.HEAD_BYTES);
+
+            for (Dirs.MdlEntry e : stagedEntries) {
+                String md5 = md5OfName(e.name);
+                Item it = new Item(null, e.name, md5, e.size, e.mtimeSec * 1000L);
+                String sig = sigOf(e.size, e.mtimeSec * 1000L);
+                FileRec cached = s.state.files.get(md5);
+                if (cached != null && sig.equals(cached.sig)) {
+                    applyCachedRec(it, cached, idx);
+                } else {
+                    it.changed = true;
+                    probed++;
+                    try {
+                        byte[] head = heads.get(e.name);
+                        if (head == null && e.size > 0) {
+                            head = Dirs.readHostMdl(s.base, e.name, e.size);
+                        } else if (head != null && !Pipeline.hasCompleteMp4Head(head) && e.size > head.length) {
+                            head = Dirs.readHostMdl(s.base, e.name, e.size);
+                        }
+                        Pipeline.Result r = Pipeline.processBytes(md5, head, e.size,
+                                null, idx, s.covers, true, true, true);
+                        it.kind = r.kind;
+                        it.title = r.title;
+                        it.artist = r.artist;
+                        it.album = r.album;
+                        it.complete = r.complete;
+                        it.hasKey = isKey(r);
+                        it.kid = r.kid;
+                    } catch (Throwable t) {
+                        it.kind = "junk";
+                    }
+                    if (cached == null) s.newCount++;
+                    saveItemRec(s.state, it, sig);
+                }
+                s.items.add(it);
+                i++;
+                if (prog != null) prog.on(i, totalCount, "扫描 " + i + "/" + totalCount);
+            }
+        } else {
+            for (File f : files) {
+                String md5 = md5OfName(f.getName());
+                Item it = new Item(f, md5);
+                String sig = sigOf(f);
+                FileRec cached = s.state.files.get(md5);
+                if (cached != null && sig.equals(cached.sig)) {
+                    applyCachedRec(it, cached, idx);
+                } else {
+                    it.changed = true;
+                    probed++;
+                    try {
+                        Pipeline.Result r = Pipeline.process(f, null, idx, s.covers, true, true, true);
+                        it.kind = r.kind;
+                        it.title = r.title;
+                        it.artist = r.artist;
+                        it.album = r.album;
+                        it.complete = r.complete;
+                        it.hasKey = isKey(r);
+                        it.kid = r.kid;
+                    } catch (Throwable t) {
+                        it.kind = "junk";
+                    }
+                    if (cached == null) s.newCount++;
+                    saveItemRec(s.state, it, sig);
+                }
+                s.items.add(it);
+                i++;
+                if (prog != null) prog.on(i, totalCount, "扫描 " + i + "/" + totalCount);
+            }
         }
         s.changedCount = probed;
 
@@ -447,6 +514,49 @@ public final class Exporter {
                     + s.preparedMs / 1000.0 + "s）");
         }
         return s;
+    }
+
+    private static void applyCachedRec(Item it, FileRec cached, Index idx) {
+        it.kind = cached.kind == null ? "" : cached.kind;
+        it.title = cached.title;
+        it.artist = cached.artist;
+        it.album = cached.album;
+        it.complete = cached.complete;
+        it.exported = cached.exported;
+        it.changed = false;
+        it.kid = cached.kid;
+        if (it.kid != null && !it.kid.isEmpty()) {
+            boolean now = idx.kid2spade.containsKey(it.kid);
+            if (now != cached.hasKey) cached.hasKey = now;
+            it.hasKey = now;
+        } else {
+            it.hasKey = cached.hasKey;
+        }
+        if (it.title == null || it.title.isEmpty()) {
+            Index.MetaHit mh = idx.fullMeta(it.md5, null);
+            String t = Json.str(mh.meta, "title");
+            if (t != null && !t.isEmpty()) {
+                it.title = t;
+                it.artist = Json.str(mh.meta, "artist");
+                it.album = Json.str(mh.meta, "album");
+                cached.title = it.title;
+                cached.artist = it.artist;
+                cached.album = it.album;
+            }
+        }
+    }
+
+    private static void saveItemRec(State state, Item it, String sig) {
+        FileRec rec = state.files.get(it.md5);
+        if (rec == null) { rec = new FileRec(); state.files.put(it.md5, rec); }
+        rec.sig = sig;
+        rec.kind = it.kind;
+        rec.title = it.title;
+        rec.artist = it.artist;
+        rec.album = it.album;
+        rec.kid = it.kid;
+        rec.complete = it.complete;
+        rec.hasKey = it.hasKey;
     }
 
     static boolean isKey(Pipeline.Result r) {
@@ -546,18 +656,11 @@ public final class Exporter {
             return st;
         }
 
-        // 暂存区可能已经被清掉了（上次导出结束就清了）—— 重新暂存一次
-        if (s.staged && !Dirs.stageAlive(s.root)) {
-            if (log != null) log.line("暂存区已失效，重新暂存 …");
-            try {
-                s.root = Dirs.stage(s.ctx);
-            } catch (Exception e) {
-                st.failed = chosen.size();
-                if (log != null) log.line("✗ 重新暂存失败: " + e.getMessage());
-                st.ms = System.currentTimeMillis() - t0;
-                return st;
-            }
-            s.base = Dirs.lastBase;
+        if (s.staged && (s.base == null || s.base.isEmpty())) {
+            st.failed = chosen.size();
+            if (log != null) log.line("✗ 宿主数据源路径无效，请先重新扫描");
+            st.ms = System.currentTimeMillis() - t0;
+            return st;
         }
 
         StringBuilder report = new StringBuilder("[\n");
@@ -570,17 +673,25 @@ public final class Exporter {
             if (log != null) log.line("▶ " + done + "/" + chosen.size() + "  " + it.display());
             if (prog != null) prog.on(done, chosen.size(), it.display());
             try {
-                Pipeline.Result r = Pipeline.process(it.file, s.sink, s.idx, s.covers, false, true, s.wantLrc);
+                Pipeline.Result r;
+                if (s.staged) {
+                    byte[] raw = Dirs.readHostMdl(s.base, it.fileName, it.size);
+                    r = Pipeline.processBytes(it.md5, raw, it.size > 0 ? it.size : raw.length,
+                            s.sink, s.idx, s.covers, false, true, s.wantLrc);
+                } else {
+                    r = Pipeline.process(it.file, s.sink, s.idx, s.covers, false, true, s.wantLrc);
+                }
                 if (!first) report.append(",\n");
                 first = false;
                 report.append(r.toJson());
                 FileRec rec = s.state.files.get(it.md5);
                 if (rec == null) { rec = new FileRec(); s.state.files.put(it.md5, rec); }
-                rec.sig = sigOf(it.file);
+                rec.sig = sigOf(it.size, it.mtimeMs);
                 rec.kind = it.kind;
                 rec.title = it.title;
                 rec.artist = it.artist;
                 rec.album = it.album;
+                rec.kid = it.kid;
                 rec.complete = it.complete;
                 rec.hasKey = it.hasKey;
                 if (r.out != null) {
@@ -613,11 +724,12 @@ public final class Exporter {
         for (Item it : s.items) {
             if (!s.state.files.containsKey(it.md5)) {
                 FileRec rec = new FileRec();
-                rec.sig = sigOf(it.file);
+                rec.sig = sigOf(it.size, it.mtimeMs);
                 rec.kind = it.kind;
                 rec.title = it.title;
                 rec.artist = it.artist;
                 rec.album = it.album;
+                rec.kid = it.kid;
                 rec.complete = it.complete;
                 rec.hasKey = it.hasKey;
                 rec.exported = false;
@@ -661,6 +773,103 @@ public final class Exporter {
             if (log != null) log.line("已清理暂存区（宿主私有数据副本不留存）");
         }
         return st;
+    }
+
+    // ------------------------------------------------------------------ 删除
+    public static final class DeleteResult {
+        public int requested, cacheOk, cacheFail, exportedDeleted;
+        public long freedBytes;
+    }
+
+    public static DeleteResult deleteSelected(Session s, List<Item> targets,
+                                              boolean alsoDeleteExported, Log log, Progress prog) {
+        DeleteResult dr = new DeleteResult();
+        if (s == null || targets == null || targets.isEmpty()) return dr;
+        dr.requested = targets.size();
+
+        java.util.Set<String> deletedNames = new java.util.LinkedHashSet<String>();
+        if (s.staged) {
+            if (s.base == null || s.base.isEmpty()) {
+                dr.cacheFail = targets.size();
+                if (log != null) log.line("✗ 宿主数据源路径无效，无法删除");
+                return dr;
+            }
+            List<String> names = new ArrayList<String>(targets.size());
+            for (Item it : targets) names.add(it.fileName);
+            if (prog != null) prog.on(0, 0, "正在删除 " + names.size() + " 个缓存文件 …");
+            deletedNames.addAll(Dirs.deleteHostMdls(s.base, names));
+        } else {
+            int idx = 0;
+            for (Item it : targets) {
+                idx++;
+                if (prog != null) prog.on(idx, targets.size(), "删除 " + it.display());
+                boolean ok = false;
+                if (it.file != null) {
+                    ok = !it.file.exists() || it.file.delete();
+                    String fn = it.file.getName();
+                    if (fn.toLowerCase(Locale.ROOT).endsWith(".mdl")) {
+                        File conf = new File(it.file.getParentFile(),
+                                fn.substring(0, fn.length() - 4) + ".mdlnodeconf");
+                        if (conf.exists()) conf.delete();
+                    }
+                }
+                if (ok) deletedNames.add(it.fileName);
+            }
+        }
+
+        List<Item> removed = new ArrayList<Item>();
+        for (Item it : targets) {
+            if (deletedNames.contains(it.fileName)) {
+                dr.cacheOk++;
+                dr.freedBytes += it.size;
+                removed.add(it);
+                if (s.state != null) s.state.files.remove(it.md5);
+                if (alsoDeleteExported && s.ctx != null) {
+                    if (deleteExportedOutput(s.ctx, it)) dr.exportedDeleted++;
+                }
+                if (log != null) log.line("🗑 已删除: " + it.display() + " (" + it.sizeText() + ")");
+            } else {
+                dr.cacheFail++;
+                if (log != null) log.line("✗ 删除失败: " + it.display());
+            }
+        }
+        if (!removed.isEmpty()) {
+            s.items.removeAll(removed);
+            if (s.stateFile != null && s.state != null) s.state.save(s.stateFile);
+        }
+        if (log != null) {
+            log.line("删除完成：成功 " + dr.cacheOk + " · 失败 " + dr.cacheFail
+                    + " · 释放 " + Item.formatSize(dr.freedBytes)
+                    + (alsoDeleteExported ? " · 同时删已导出 " + dr.exportedDeleted + " 首" : ""));
+        }
+        return dr;
+    }
+
+    private static boolean deleteExportedOutput(Context ctx, Item it) {
+        String outName = Pipeline.outName(it.artist, it.title, it.md5, it.kind);
+        boolean any = false;
+        try {
+            File f = new File("/sdcard/" + REL, outName);
+            if (f.exists() && f.delete()) any = true;
+            int dot = outName.lastIndexOf('.');
+            if (dot > 0) {
+                String lrcName = outName.substring(0, dot) + ".lrc";
+                File lf = new File("/sdcard/" + REL, lrcName);
+                if (lf.exists()) lf.delete();
+                File dlLrc = new File("/sdcard/Download/" + MediaStoreSink.leaf(REL), lrcName);
+                if (dlLrc.exists()) dlLrc.delete();
+            }
+        } catch (Throwable ignore) { }
+        try {
+            int rows = ctx.getContentResolver().delete(
+                    android.provider.MediaStore.Audio.Media.getContentUri(
+                            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                    android.provider.MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? AND "
+                            + android.provider.MediaStore.MediaColumns.DISPLAY_NAME + "=?",
+                    new String[]{REL + "%", outName});
+            if (rows > 0) any = true;
+        } catch (Throwable ignore) { }
+        return any;
     }
 
     /** 手动：准备 + 导出全部可导出（保留 API 语义） */
@@ -724,6 +933,38 @@ public final class Exporter {
 
     // ------------------------------------------------------------------ 独立模式的偏好设置
     private static final String PREF = "luna";
+    public static final int SORT_ALPHA = 0, SORT_SIZE = 1, SORT_TIME = 2;
+
+    public static int sortMode(Context ctx) {
+        try {
+            int m = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getInt("sort_mode", SORT_ALPHA);
+            return (m >= SORT_ALPHA && m <= SORT_TIME) ? m : SORT_ALPHA;
+        } catch (Throwable t) {
+            return SORT_ALPHA;
+        }
+    }
+
+    public static void setSortMode(Context ctx, int mode) {
+        try {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                    .edit().putInt("sort_mode", mode).apply();
+        } catch (Throwable ignore) { }
+    }
+
+    public static boolean sortAsc(Context ctx) {
+        try {
+            return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("sort_asc", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    public static void setSortAsc(Context ctx, boolean asc) {
+        try {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                    .edit().putBoolean("sort_asc", asc).apply();
+        } catch (Throwable ignore) { }
+    }
 
     /**
      * 「启动时自动增量导出」开关。

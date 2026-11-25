@@ -105,6 +105,25 @@ public final class Pipeline {
         return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z');
     }
 
+    public static boolean isMp3(byte[] raw) {
+        if (raw == null || raw.length < 1024) return false;
+        if (raw[0] == 'I' && raw[1] == 'D' && raw[2] == '3') return true;
+        int b0 = raw[0] & 0xFF, b1 = raw[1] & 0xFF;
+        return b0 == 0xFF && (b1 & 0xE0) == 0xE0 && (b1 & 0x06) != 0;
+    }
+
+    public static boolean hasCompleteMp4Head(byte[] head) {
+        if (head == null || head.length < 1024 || isMp3(head)) return true;
+        if (!(isAsciiAlnum(head[4]) && isAsciiAlnum(head[5])
+                && isAsciiAlnum(head[6]) && isAsciiAlnum(head[7]))) return true;
+        for (Mp4.Box bx : Mp4.boxes(head, 0, head.length)) {
+            if (bx.is(Mp4.b4("moov"))) {
+                return bx.pos + bx.size <= head.length;
+            }
+        }
+        return false;
+    }
+
     /** dry=true 只体检；sink=null 也不落盘 */
     public static Result process(File src, Sink sink, Index idx, CoverProvider covers,
                                  boolean dry, boolean tag, boolean wantLrc) {
@@ -119,9 +138,45 @@ public final class Pipeline {
             r.kind = "junk";
             return r;
         }
+        return processBytes(md5, raw, raw.length, sink, idx, covers, dry, tag, wantLrc);
+    }
+
+    public static Result processBytes(String md5, byte[] raw, long realFileSize, Sink sink,
+                                      Index idx, CoverProvider covers,
+                                      boolean dry, boolean tag, boolean wantLrc) {
         Result info = blank(md5);
-        info.fileSize = raw.length;
-        if (raw.length < 1024 || !(isAsciiAlnum(raw[4]) && isAsciiAlnum(raw[5])
+        info.fileSize = realFileSize;
+        if (raw == null || raw.length < 1024) {
+            info.kind = "junk";
+            return info;
+        }
+
+        if (isMp3(raw)) {
+            info.kind = "mp3";
+            info.dataSize = realFileSize;
+            info.complete = true;
+            Index.MetaHit mm = idx.fullMeta(md5, null);
+            Map<String, Object> mmeta = mm.meta;
+            info.vid = mm.vid;
+            info.title = Json.str(mmeta, "title");
+            info.artist = Json.str(mmeta, "artist");
+            info.album = Json.str(mmeta, "album");
+            String mlrc = Tags.krcToLrc(Json.str(mmeta, "lyric"));
+            Map<String, String> mtags = tagsOf(info, mlrc);
+            if (!dry && sink != null) {
+                byte[] data = raw;
+                if (tag) {
+                    byte[] cov = covers == null ? null : covers.get(Json.asMap(mmeta.get("cover")));
+                    data = Tags.mp3Embed(data, mtags, cov);
+                    info.tagged = nonEmpty(mtags.get("TITLE")) || nonEmpty(mtags.get("ARTIST"));
+                    info.hasCover = cov != null && cov.length > 0;
+                }
+                emit(info, sink, data, ".mp3", mlrc, wantLrc);
+            }
+            return info;
+        }
+
+        if (!(isAsciiAlnum(raw[4]) && isAsciiAlnum(raw[5])
                 && isAsciiAlnum(raw[6]) && isAsciiAlnum(raw[7]))) {
             info.kind = "junk";
             return info;
@@ -141,9 +196,9 @@ public final class Pipeline {
         }
         boolean complete;
         if ("plain".equals(kind) || "video".equals(kind)) {
-            complete = !table.isEmpty() && sizeSum <= b.length && maxOff <= b.length;
+            complete = !table.isEmpty() && sizeSum <= realFileSize && maxOff <= realFileSize;
         } else {
-            complete = !table.isEmpty() && sizeSum <= b.length && maxOff <= b.length
+            complete = !table.isEmpty() && sizeSum <= realFileSize && maxOff <= realFileSize
                     && n == table.size();
         }
 
@@ -271,7 +326,8 @@ public final class Pipeline {
     public static String outName(String artist, String title, String md5, String kind) {
         String base = (title != null && !title.isEmpty())
                 ? Tags.safe(dash(artist, title), md5) : md5;
-        return base + ("flac".equals(kind) ? ".flac" : ".m4a");
+        String ext = "flac".equals(kind) ? ".flac" : ("mp3".equals(kind) ? ".mp3" : ".m4a");
+        return base + ext;
     }
 
     private static void emit(Result info, Sink sink, byte[] data, String ext,

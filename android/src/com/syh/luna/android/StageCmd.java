@@ -49,6 +49,12 @@ public final class StageCmd {
 
     /** tar 流与文本诊断的分隔标记（App 侧按这个切分 stdout） */
     public static final String TAR_BEGIN = "LUNA_TAR_BEGIN\n";
+    /** 批量读 .mdl 头部流的分隔标记 */
+    public static final String HEAD_BEGIN = "LUNA_HEAD_BEGIN\n";
+    /** 单文件流读取的分隔标记 */
+    public static final String FILE_BEGIN = "LUNA_FILE_BEGIN\n";
+    /** 扫描体检读取的单个 .mdl 头部上限（512 KB，覆盖真机 MP4 moov） */
+    public static final int HEAD_BYTES = 512 * 1024;
 
     /**
      * 需要暂存的数据子路径。
@@ -64,6 +70,15 @@ public final class StageCmd {
             "files/NetCacheLoader",     // 接口原始 JSON blob（files 版）—— 与上面是两套缓存，都要读
             "files/keva",               // key-value 缓存（含 cached_queue / initial_record 等 .sgv）
             "files/luna_export",        // 本模块 hook 抓到的密钥仓
+    };
+
+    /** 轻量化暂存子路径：只搬索引所需的元数据目录，不搬动辄数 GB 的 files/music */
+    public static final String[] META_SUB = {
+            "databases",
+            "cache/NetCacheLoader",
+            "files/NetCacheLoader",
+            "files/keva",
+            "files/luna_export",
     };
 
     // ================================================================== 方案 A：tar 流（首选）
@@ -113,16 +128,16 @@ public final class StageCmd {
         sb.append("if [ -z \"$BASE\" ]; then echo 'LUNA_NO_BASE'; exit 7; fi; ");
         sb.append("echo \"LUNA_BASE=$BASE\"; ");
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
-        // ---- ② 清单：存在性检查用**绝对路径**（su 的 CWD 不是 $BASE），
-        //         但存进位置参数（set --）而不是字符串
-        //
-        // ⚠️ 不能用 `LIST="$LIST a b"` 累积字符串再 `tar ... $LIST` ——
-        //    shell 会按 IFS 分词，路径里有空格就直接碎了，
-        //    而且 `$LIST` 未加引号时还会做 glob 展开。
-        //    正确做法是 `set -- "$@" <path>` 逐个追加位置参数，
-        //    最后 `tar -c -f - "$@"` 展开成多个独立参数。
+        // ---- 输出 files/music/*.mdl 元清单（size:mtime:name），免去搬运数 GB .mdl 本体
+        sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
+        sb.append("for f in *.mdl *.MDL; do ");
+        sb.append("[ -f \"$f\" ] || continue; ");
+        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
+        sb.append("done; fi; ");
+        // ---- ② 清单：仅打包元数据子目录（META_SUB），绝不打包数 GB 的 files/music
         sb.append("set --; ");
-        for (String sub : SUB) {
+        for (String sub : META_SUB) {
             sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then set -- \"$@\" ")
               .append(sub).append("; fi; ");
         }
@@ -210,8 +225,8 @@ public final class StageCmd {
           .append("; else BASE=").append(B).append("; fi; ");
         sb.append("echo \"BASE=$BASE\"; ");
 
-        // ★ 复制清单直接由 SUB 驱动 —— 不会再出现「声明了却没复制」的漏索引
-        for (String sub : SUB) pair(sb, sub);
+        // ★ 复制清单仅包含元数据目录（META_SUB），不搬运 files/music
+        for (String sub : META_SUB) pair(sb, sub);
 
         // ---- ③ 回执：**先写**，后面的 chown/chcon/chmod 会一并覆盖它
         // （原来写在 chown 之后 → 属主 root + 权限 600 → App 永远读不到）
@@ -231,7 +246,91 @@ public final class StageCmd {
         sb.append("echo \"OKLABEL=$(ls -Zd \"$S/.luna_ok\" 2>/dev/null | tr ' ' '\\n' | grep '^u:' | head -1)\"; ");
         sb.append("echo \"DIRLABEL=$(ls -Zd \"$S\" 2>/dev/null | tr ' ' '\\n' | grep '^u:' | head -1)\"; ");
         sb.append("echo \"OWNER=$(stat -c %u \"$S\" 2>/dev/null)\"; ");
-        sb.append("echo \"COUNT=$(ls \"$S/files_music\" 2>/dev/null | wc -l)\"; ");
+        sb.append("echo \"COUNT=$(ls \"$BASE/files/music\" 2>/dev/null | wc -l)\"; ");
+        sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
+        sb.append("for f in *.mdl *.MDL; do ");
+        sb.append("[ -f \"$f\" ] || continue; ");
+        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
+        sb.append("done; fi; ");
+        return sb.toString();
+    }
+
+    static boolean safeFileName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0
+                || name.indexOf('\n') >= 0 || name.indexOf('\r') >= 0
+                || name.indexOf('\0') >= 0 || name.contains("..")) return false;
+        return true;
+    }
+
+    static boolean allowedHostBase(String base) {
+        if (base == null) return false;
+        return ("/data/data/" + HOST_PKG).equals(base)
+                || ("/proc/1/root/data/data/" + HOST_PKG).equals(base)
+                || ("/data/user/0/" + HOST_PKG).equals(base);
+    }
+
+    static boolean safeMdlName(String name) {
+        if (!safeFileName(name)) return false;
+        if (name.indexOf('*') >= 0 || name.indexOf('?') >= 0) return false;
+        return name.toLowerCase(java.util.Locale.ROOT).endsWith(".mdl");
+    }
+
+    /** 仅允许按白名单路径安全删除宿主 .mdl 及其伴生 .mdlnodeconf（严禁 rm -rf） */
+    public static String buildDeleteMdl(String base, java.util.List<String> names) {
+        if (!allowedHostBase(base)) {
+            throw new IllegalArgumentException("非法的宿主基路径: " + base);
+        }
+        StringBuilder sb = new StringBuilder();
+        if (names != null) {
+            for (String name : names) {
+                if (!safeMdlName(name)) continue;
+                String stem = name.substring(0, name.length() - 4);
+                String mdl = base + "/files/music/" + name;
+                String conf = base + "/files/music/" + stem + ".mdlnodeconf";
+                sb.append("f=").append(q(mdl)).append("; c=").append(q(conf)).append("; ");
+                sb.append("rm -f \"$f\" \"$c\" 2>/dev/null; ");
+                sb.append("if [ ! -e \"$f\" ]; then printf 'DEL_OK=%s\\n' ").append(q(name))
+                  .append("; else printf 'DEL_FAIL=%s\\n' ").append(q(name)).append("; fi; ");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 按需读取单个宿主 .mdl 文件流（cat 到 stdout） */
+    public static String buildReadFile(String base, String name) {
+        if (base == null || base.isEmpty() || !safeFileName(name)) {
+            throw new IllegalArgumentException("非法路径: " + name);
+        }
+        String full = base + "/files/music/" + name;
+        return "printf '" + FILE_BEGIN.replace("\n", "\\n") + "'; cat " + q(full) + "; ";
+    }
+
+    /** 批量读取多个宿主 .mdl 的头部（前 maxBytes 字节），供扫描体检使用 */
+    public static String buildReadHeadBatch(String base, java.util.List<String> names, int maxBytes) {
+        if (base == null || base.isEmpty()) {
+            throw new IllegalArgumentException("base 为空");
+        }
+        int blocks = Math.max(1, (maxBytes + 4095) / 4096);
+        int cap = blocks * 4096;
+        StringBuilder sb = new StringBuilder();
+        sb.append("printf '").append(HEAD_BEGIN.replace("\n", "\\n")).append("'; ");
+        if (names != null) {
+            for (String name : names) {
+                if (!safeFileName(name)) continue;
+                String full = base + "/files/music/" + name;
+                sb.append("f=").append(q(full)).append("; ");
+                sb.append("if [ -f \"$f\" ]; then ");
+                sb.append("sz=$(stat -c %s \"$f\" 2>/dev/null || echo 0); ");
+                sb.append("if [ \"$sz\" -gt ").append(cap).append(" ]; then n=").append(cap)
+                  .append("; else n=$sz; fi; ");
+                sb.append("printf 'H %d %s\\n' \"$n\" ").append(q(name)).append("; ");
+                sb.append("[ \"$n\" -gt 0 ] && dd if=\"$f\" bs=4096 count=").append(blocks)
+                  .append(" 2>/dev/null; ");
+                sb.append("else printf 'H 0 %s\\n' ").append(q(name)).append("; fi; ");
+            }
+        }
         return sb.toString();
     }
 

@@ -114,20 +114,27 @@ public final class StageCmd {
         sb.append("echo \"LUNA_BASE=$BASE\"; ");
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
         // ---- ② 清单：存在性检查用**绝对路径**（su 的 CWD 不是 $BASE），
-        //         但存进 LIST 的是**相对路径**（tar 里要的是相对 $BASE 的路径）
-        sb.append("LIST=; ");
+        //         但存进位置参数（set --）而不是字符串
+        //
+        // ⚠️ 不能用 `LIST="$LIST a b"` 累积字符串再 `tar ... $LIST` ——
+        //    shell 会按 IFS 分词，路径里有空格就直接碎了，
+        //    而且 `$LIST` 未加引号时还会做 glob 展开。
+        //    正确做法是 `set -- "$@" <path>` 逐个追加位置参数，
+        //    最后 `tar -c -f - "$@"` 展开成多个独立参数。
+        sb.append("set --; ");
         for (String sub : SUB) {
-            sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then LIST=\"$LIST ")
-              .append(sub).append("\"; fi; ");
+            sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then set -- \"$@\" ")
+              .append(sub).append("; fi; ");
         }
-        sb.append("echo \"LUNA_LIST=$LIST\"; ");
+        // 清单内容（诊断用，打印在二进制标记之前）
+        sb.append("echo \"LUNA_LIST=$*\"; ");
         // 空清单必须挡住 —— 否则 `tar -c -f -`（无操作数）会把**整个 $BASE** 打包
-        sb.append("if [ -z \"$LIST\" ]; then echo 'LUNA_NO_LIST'; exit 6; fi; ");
+        sb.append("if [ $# -eq 0 ]; then echo 'LUNA_NO_LIST'; exit 6; fi; ");
         // ---- ③ 分隔标记：App 从这行之后开始按二进制读
         sb.append("printf '").append(TAR_BEGIN.replace("\n", "\\n")).append("'; ");
         // ---- ④ 打包
         sb.append("cd \"$BASE\" 2>/dev/null || exit 8; ");
-        sb.append(tarStyle).append(" -c -f - $LIST; ");
+        sb.append(tarStyle).append(" -c -f - \"$@\"; ");
         sb.append("printf '\\nLUNA_TAR_END\\n'; ");
         return sb.toString();
     }

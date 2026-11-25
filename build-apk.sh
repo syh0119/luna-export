@@ -77,6 +77,7 @@ set +e
 "$JAVAC" -encoding UTF-8 -nowarn -d "$SELFTEST_OUT" \
   "$ROOT/android/src/com/syh/luna/android/Tar.java" \
   "$ROOT/android/src/com/syh/luna/android/StageCmd.java" \
+  "$ROOT/android/src/com/syh/luna/android/StageE2E.java" \
   "$ROOT/android/src/com/syh/luna/android/DirsSelfTest.java" > "$OUT/selftest.log" 2>&1
 if [ $? -ne 0 ]; then
   set -e; echo "!! 自测编译失败"; cat "$OUT/selftest.log"; exit 1
@@ -88,6 +89,17 @@ set -e
 grep -a "FAIL" "$OUT/selftest.log" | head -10 || true
 if [ $RC -ne 0 ]; then echo "!! 自测未通过（详见 out/apk/selftest.log）"; cat "$OUT/selftest.log"; exit 1; fi
 echo "      自测通过"
+
+# ---- 端到端模拟：真跑一遍「su 只读 → tar 流 → App 解包」----
+# 这一步用本机真实的 sh + tar 执行生成的命令，验证的不只是语法，而是整条链路真的通。
+# ⚠️ 这就是当初「LIST 被 shell 分词」那个 bug 被抓出来的地方 —— 只有真跑才能发现。
+set +e
+"$JAVA_BIN" -Dfile.encoding=UTF-8 -cp "$SELFTEST_OUT" com.syh.luna.android.StageE2E > "$OUT/e2e.log" 2>&1
+RC=$?
+set -e
+grep -a "FAIL" "$OUT/e2e.log" | head -10 || true
+if [ $RC -ne 0 ]; then echo "!! 端到端模拟未通过（详见 out/apk/e2e.log）"; cat "$OUT/e2e.log"; exit 1; fi
+echo "      端到端模拟通过"
 
 set +e
 "$JAVAC" -encoding UTF-8 -nowarn \

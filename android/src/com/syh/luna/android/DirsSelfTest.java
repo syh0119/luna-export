@@ -44,8 +44,15 @@ public final class DirsSelfTest {
         fail += check("tar 命令有空清单保护", tcmd.contains("LUNA_NO_LIST"));
         fail += check("tar 命令用 -f - 输出到 stdout", tcmd.contains("-f -"));
         fail += check("tar 命令不硬编码 /data/local/tmp", !tcmd.contains("/data/local/tmp"));
+        // ★ 用位置参数（set --）而不是字符串累积 ——
+        //   `LIST="$LIST a b"` + `tar ... $LIST` 会被 shell 按 IFS 分词，
+        //   路径里有空格就碎了，而且未加引号还会做 glob 展开。
+        fail += check("★tar 清单用位置参数 set --（字符串累积会被 shell 分词）",
+                tcmd.contains("set --") && tcmd.contains("\"$@\""));
+        fail += check("★tar 空清单判据用 $#（字符串判据在 set -- 下无效）",
+                tcmd.contains("$# -eq 0"));
         for (String sub : StageCmd.SUB) {
-            fail += check("tar 清单含 " + sub, tcmd.contains("LIST=\"$LIST " + sub));
+            fail += check("tar 清单含 " + sub, tcmd.contains("set -- \"$@\" " + sub));
         }
         int sc = shellSyntax("tar 命令 sh -n 通过", tcmd);
         if (sc >= 0) fail += sc;

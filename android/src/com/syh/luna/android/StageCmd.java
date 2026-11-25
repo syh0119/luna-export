@@ -128,13 +128,8 @@ public final class StageCmd {
         sb.append("if [ -z \"$BASE\" ]; then echo 'LUNA_NO_BASE'; exit 7; fi; ");
         sb.append("echo \"LUNA_BASE=$BASE\"; ");
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
-        // ---- 输出 files/music/*.mdl 元清单（size:mtime:name），免去搬运数 GB .mdl 本体
-        sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
-        sb.append("for f in *.mdl *.MDL; do ");
-        sb.append("[ -f \"$f\" ] || continue; ");
-        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
-        sb.append("done; fi; ");
+        // ---- 输出 files/music/*.mdl 与 files/download/<uid>/* 元清单（size:mtime:relPath），免去搬运数 GB 本体
+        appendEnumerateMdl(sb);
         // ---- ② 清单：仅打包元数据子目录（META_SUB），绝不打包数 GB 的 files/music
         sb.append("set --; ");
         for (String sub : META_SUB) {
@@ -247,20 +242,45 @@ public final class StageCmd {
         sb.append("echo \"DIRLABEL=$(ls -Zd \"$S\" 2>/dev/null | tr ' ' '\\n' | grep '^u:' | head -1)\"; ");
         sb.append("echo \"OWNER=$(stat -c %u \"$S\" 2>/dev/null)\"; ");
         sb.append("echo \"COUNT=$(ls \"$BASE/files/music\" 2>/dev/null | wc -l)\"; ");
+        appendEnumerateMdl(sb);
+        return sb.toString();
+    }
+
+    private static void appendEnumerateMdl(StringBuilder sb) {
         sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
         sb.append("for f in *.mdl *.MDL; do ");
-        sb.append("[ -f \"$f\" ] || continue; ");
+        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
         sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:music/%s\\n' \"$st\" \"$f\"; ");
         sb.append("done; fi; ");
-        return sb.toString();
+        sb.append("if cd \"$BASE/files/download\" 2>/dev/null; then ");
+        sb.append("for d in [0-9]*; do ");
+        sb.append("[ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; ");
+        sb.append("case \"$d\" in ''|*[!0-9]*) continue;; esac; ");
+        sb.append("for f in \"$d\"/*; do ");
+        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
+        sb.append("bn=${f#*/}; ");
+        sb.append("case \"$bn\" in ''|*[!0-9A-Za-z_-]*) continue;; esac; ");
+        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:download/%s\\n' \"$st\" \"$f\"; ");
+        sb.append("done; done; fi; ");
+    }
+
+    static String normalizeRel(String relOrName) {
+        if (relOrName == null) return null;
+        return relOrName.indexOf('/') < 0 ? ("music/" + relOrName) : relOrName;
     }
 
     static boolean safeFileName(String name) {
         if (name == null || name.isEmpty()) return false;
+        if (".".equals(name) || "..".equals(name) || name.startsWith(".")) return false;
         if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0
                 || name.indexOf('\n') >= 0 || name.indexOf('\r') >= 0
-                || name.indexOf('\0') >= 0 || name.contains("..")) return false;
+                || name.indexOf('\0') >= 0) return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c < 0x20 || c == 0x7f) return false;
+        }
         return true;
     }
 
@@ -273,41 +293,81 @@ public final class StageCmd {
 
     static boolean safeMdlName(String name) {
         if (!safeFileName(name)) return false;
-        if (name.indexOf('*') >= 0 || name.indexOf('?') >= 0) return false;
+        if (name.length() <= 4 || name.indexOf('*') >= 0 || name.indexOf('?') >= 0) return false;
         return name.toLowerCase(java.util.Locale.ROOT).endsWith(".mdl");
     }
 
-    /** 仅允许按白名单路径安全删除宿主 .mdl 及其伴生 .mdlnodeconf（严禁 rm -rf） */
+    static String safeRelPath(String rel) {
+        if (rel == null || rel.isEmpty()) throw new IllegalArgumentException("empty relPath");
+        if (rel.startsWith("music/")) {
+            String name = rel.substring(6);
+            if (!safeMdlName(name)) throw new IllegalArgumentException("unsafe music rel: " + rel);
+            return rel;
+        }
+        if (rel.startsWith("download/")) {
+            String rest = rel.substring(9);
+            int slash = rest.indexOf('/');
+            if (slash <= 0 || slash >= rest.length() - 1 || rest.indexOf('/', slash + 1) >= 0) {
+                throw new IllegalArgumentException("invalid download rel: " + rel);
+            }
+            String uid = rest.substring(0, slash);
+            String name = rest.substring(slash + 1);
+            for (int i = 0; i < uid.length(); i++) {
+                char c = uid.charAt(i);
+                if (c < '0' || c > '9') throw new IllegalArgumentException("invalid uid: " + rel);
+            }
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                boolean ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+                        || (c >= 'a' && c <= 'z') || c == '_' || c == '-';
+                if (!ok) throw new IllegalArgumentException("unsafe download name: " + rel);
+            }
+            return rel;
+        }
+        throw new IllegalArgumentException("unsupported relPath: " + rel);
+    }
+
+    /** 仅允许按白名单路径安全删除宿主音频及伴生配置（严禁 rm -rf） */
     public static String buildDeleteMdl(String base, java.util.List<String> names) {
         if (!allowedHostBase(base)) {
             throw new IllegalArgumentException("非法的宿主基路径: " + base);
         }
         StringBuilder sb = new StringBuilder();
         if (names != null) {
-            for (String name : names) {
-                if (!safeMdlName(name)) continue;
-                String stem = name.substring(0, name.length() - 4);
-                String mdl = base + "/files/music/" + name;
-                String conf = base + "/files/music/" + stem + ".mdlnodeconf";
-                sb.append("f=").append(q(mdl)).append("; c=").append(q(conf)).append("; ");
-                sb.append("rm -f \"$f\" \"$c\" 2>/dev/null; ");
-                sb.append("if [ ! -e \"$f\" ]; then printf 'DEL_OK=%s\\n' ").append(q(name))
-                  .append("; else printf 'DEL_FAIL=%s\\n' ").append(q(name)).append("; fi; ");
+            for (String raw : names) {
+                String rel;
+                try {
+                    rel = safeRelPath(normalizeRel(raw));
+                } catch (IllegalArgumentException e) {
+                    continue;
+                }
+                String full = base + "/files/" + rel;
+                sb.append("f=").append(q(full)).append("; ");
+                if (rel.startsWith("music/")) {
+                    String conf = base + "/files/" + rel.substring(0, rel.length() - 4) + ".mdlnodeconf";
+                    sb.append("c=").append(q(conf)).append("; rm -f \"$f\" \"$c\" 2>/dev/null; ");
+                } else {
+                    sb.append("rm -f \"$f\" 2>/dev/null; ");
+                }
+                sb.append("if [ ! -e \"$f\" ]; then printf 'DEL_OK=%s\\n' ").append(q(raw))
+                  .append("; else printf 'DEL_FAIL=%s\\n' ").append(q(raw)).append("; fi; ");
             }
         }
         return sb.toString();
     }
 
-    /** 按需读取单个宿主 .mdl 文件流（cat 到 stdout） */
+    /** 按需读取单个宿主文件流（cat 到 stdout） */
     public static String buildReadFile(String base, String name) {
-        if (base == null || base.isEmpty() || !safeFileName(name)) {
-            throw new IllegalArgumentException("非法路径: " + name);
+        if (base == null || base.isEmpty()) {
+            throw new IllegalArgumentException("base 为空");
         }
-        String full = base + "/files/music/" + name;
-        return "printf '" + FILE_BEGIN.replace("\n", "\\n") + "'; cat " + q(full) + "; ";
+        String rel = safeRelPath(normalizeRel(name));
+        String full = base + "/files/" + rel;
+        return "printf '" + FILE_BEGIN.replace("\n", "\\n") + "'; f=" + q(full)
+                + "; if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then cat \"$f\"; fi; ";
     }
 
-    /** 批量读取多个宿主 .mdl 的头部（前 maxBytes 字节），供扫描体检使用 */
+    /** 批量读取多个宿主文件的头部（前 maxBytes 字节），供扫描体检使用 */
     public static String buildReadHeadBatch(String base, java.util.List<String> names, int maxBytes) {
         if (base == null || base.isEmpty()) {
             throw new IllegalArgumentException("base 为空");
@@ -317,18 +377,23 @@ public final class StageCmd {
         StringBuilder sb = new StringBuilder();
         sb.append("printf '").append(HEAD_BEGIN.replace("\n", "\\n")).append("'; ");
         if (names != null) {
-            for (String name : names) {
-                if (!safeFileName(name)) continue;
-                String full = base + "/files/music/" + name;
+            for (String raw : names) {
+                String rel;
+                try {
+                    rel = safeRelPath(normalizeRel(raw));
+                } catch (IllegalArgumentException e) {
+                    continue;
+                }
+                String full = base + "/files/" + rel;
                 sb.append("f=").append(q(full)).append("; ");
-                sb.append("if [ -f \"$f\" ]; then ");
+                sb.append("if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then ");
                 sb.append("sz=$(stat -c %s \"$f\" 2>/dev/null || echo 0); ");
                 sb.append("if [ \"$sz\" -gt ").append(cap).append(" ]; then n=").append(cap)
                   .append("; else n=$sz; fi; ");
-                sb.append("printf 'H %d %s\\n' \"$n\" ").append(q(name)).append("; ");
+                sb.append("printf 'H %d %s\\n' \"$n\" ").append(q(raw)).append("; ");
                 sb.append("[ \"$n\" -gt 0 ] && dd if=\"$f\" bs=4096 count=").append(blocks)
                   .append(" 2>/dev/null; ");
-                sb.append("else printf 'H 0 %s\\n' ").append(q(name)).append("; fi; ");
+                sb.append("else printf 'H 0 %s\\n' ").append(q(raw)).append("; fi; ");
             }
         }
         return sb.toString();

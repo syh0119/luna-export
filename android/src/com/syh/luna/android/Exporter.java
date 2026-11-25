@@ -111,6 +111,7 @@ public final class Exporter {
         public final File file;
         public final String fileName;
         public final String md5;
+        public final boolean fromDownload;
         public String kind = "";
         public String title;
         public String artist;
@@ -126,7 +127,7 @@ public final class Exporter {
         public volatile boolean selected;
 
         Item(File f, String md5) {
-            this(f, f == null ? (md5 + ".mdl") : f.getName(), md5,
+            this(f, "music/" + (f == null ? (md5 + ".mdl") : f.getName()), md5,
                     f == null ? 0L : f.length(), f == null ? 0L : f.lastModified());
         }
 
@@ -134,6 +135,7 @@ public final class Exporter {
             this.file = f;
             this.fileName = fileName;
             this.md5 = md5;
+            this.fromDownload = fileName != null && fileName.startsWith("download/");
             this.size = size;
             this.mtimeMs = mtimeMs;
         }
@@ -166,7 +168,11 @@ public final class Exporter {
             if ("video".equals(kind)) return "MV 视频 · 已忽略";
             if ("junk".equals(kind)) return "无效文件";
             StringBuilder sb = new StringBuilder();
-            if (artist != null && !artist.isEmpty()) sb.append(artist);
+            if (fromDownload) sb.append("离线下载");
+            if (artist != null && !artist.isEmpty()) {
+                if (sb.length() > 0) sb.append(" · ");
+                sb.append(artist);
+            }
             if (album != null && !album.isEmpty()) {
                 if (sb.length() > 0) sb.append(" · ");
                 sb.append(album);
@@ -303,6 +309,61 @@ public final class Exporter {
                 ? n.substring(0, n.length() - 4) : n;
     }
 
+    static String cacheKeyForRel(String rel) {
+        if (rel == null) return "";
+        if (rel.startsWith("music/")) {
+            return md5OfName(rel.substring(6));
+        }
+        if (rel.startsWith("download/")) {
+            return "dl:" + rel.substring(9);
+        }
+        return md5OfName(rel);
+    }
+
+    private static List<File> listDownloadFiles(File dlRoot) {
+        List<File> out = new ArrayList<File>();
+        File[] uids = dlRoot == null ? null : dlRoot.listFiles();
+        if (uids == null) return out;
+        for (File u : uids) {
+            if (!u.isDirectory()) continue;
+            String un = u.getName();
+            if (un.isEmpty() || !un.matches("[0-9]+")) continue;
+            File[] fs = u.listFiles();
+            if (fs == null) continue;
+            for (File f : fs) {
+                if (f.isFile() && f.getName().matches("[0-9A-Za-z_-]+")) out.add(f);
+            }
+        }
+        return out;
+    }
+
+    private static List<Item> deduplicateItems(List<Item> scanned) {
+        Map<String, Item> best = new LinkedHashMap<String, Item>();
+        for (Item it : scanned) {
+            if (!it.complete || it.kid == null || it.kid.isEmpty()) continue;
+            String k = it.kid + ":" + it.size;
+            Item prev = best.get(k);
+            if (prev == null) {
+                best.put(k, it);
+            } else if (!prev.fromDownload && it.fromDownload) {
+                it.exported = it.exported || prev.exported;
+                best.put(k, it);
+            } else {
+                prev.exported = prev.exported || it.exported;
+            }
+        }
+        java.util.Set<Item> keep = java.util.Collections.newSetFromMap(
+                new java.util.IdentityHashMap<Item, Boolean>());
+        keep.addAll(best.values());
+        List<Item> out = new ArrayList<Item>(scanned.size());
+        for (Item it : scanned) {
+            if (!it.complete || it.kid == null || it.kid.isEmpty() || keep.contains(it)) {
+                out.add(it);
+            }
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------ 准备
     public static Session prepare(Context ctx, boolean rootMode, Log log, Progress prog) {
         long t0 = System.currentTimeMillis();
@@ -311,6 +372,7 @@ public final class Exporter {
 
         List<Dirs.MdlEntry> stagedEntries = null;
         List<File> files = null;
+        List<String> localRels = null;
         if (rootMode) {
             if (prog != null) prog.on(0, 0, "检查 root 权限 …");
             if (!Dirs.hasRoot()) {
@@ -346,15 +408,23 @@ public final class Exporter {
             stagedEntries = new ArrayList<Dirs.MdlEntry>(Dirs.lastMdlList);
             if (stagedEntries.isEmpty()) {
                 Dirs.cleanup(s.root);
-                s.error = "没找到 .mdl（root 模式请确认 su 已授权且汽水音乐已有缓存）";
+                s.error = "没找到缓存或离线下载曲目（root 模式请确认 su 已授权）";
                 if (log != null) log.line("✗ " + s.error);
                 return s;
             }
         } else {
             s.root = Dirs.inProcess(ctx);
             s.staged = false;
-            File mdlDir = IndexBuilder.sub(s.root, "files/music", false);
-            files = Pipeline.listMdl(mdlDir);
+            files = new ArrayList<File>();
+            localRels = new ArrayList<String>();
+            for (File f : Pipeline.listMdl(IndexBuilder.sub(s.root, "files/music", false))) {
+                files.add(f);
+                localRels.add("music/" + f.getName());
+            }
+            for (File f : listDownloadFiles(IndexBuilder.sub(s.root, "files/download", false))) {
+                files.add(f);
+                localRels.add("download/" + f.getParentFile().getName() + "/" + f.getName());
+            }
             if (files.isEmpty()) {
                 s.error = "没找到 .mdl（LSPosed 模式请确认作用域已勾选并重启过宿主）";
                 if (log != null) log.line("✗ " + s.error);
@@ -386,7 +456,7 @@ public final class Exporter {
         if (rootMode) {
             List<String> needHeads = new ArrayList<String>();
             for (Dirs.MdlEntry e : stagedEntries) {
-                String md5 = md5OfName(e.name);
+                String md5 = cacheKeyForRel(e.name);
                 String sig = sigOf(e.size, e.mtimeSec * 1000L);
                 FileRec cached = s.state.files.get(md5);
                 if (cached == null || !sig.equals(cached.sig)) {
@@ -401,7 +471,7 @@ public final class Exporter {
                     : Dirs.readHostMdlHeads(s.base, needHeads, StageCmd.HEAD_BYTES);
 
             for (Dirs.MdlEntry e : stagedEntries) {
-                String md5 = md5OfName(e.name);
+                String md5 = cacheKeyForRel(e.name);
                 Item it = new Item(null, e.name, md5, e.size, e.mtimeSec * 1000L);
                 String sig = sigOf(e.size, e.mtimeSec * 1000L);
                 FileRec cached = s.state.files.get(md5);
@@ -437,9 +507,11 @@ public final class Exporter {
                 if (prog != null) prog.on(i, totalCount, "扫描 " + i + "/" + totalCount);
             }
         } else {
-            for (File f : files) {
-                String md5 = md5OfName(f.getName());
-                Item it = new Item(f, md5);
+            for (int fi = 0; fi < files.size(); fi++) {
+                File f = files.get(fi);
+                String rel = localRels.get(fi);
+                String md5 = cacheKeyForRel(rel);
+                Item it = new Item(f, rel, md5, f.length(), f.lastModified());
                 String sig = sigOf(f);
                 FileRec cached = s.state.files.get(md5);
                 if (cached != null && sig.equals(cached.sig)) {
@@ -448,7 +520,9 @@ public final class Exporter {
                     it.changed = true;
                     probed++;
                     try {
-                        Pipeline.Result r = Pipeline.process(f, null, idx, s.covers, true, true, true);
+                        byte[] raw = Index.readBytes(f);
+                        Pipeline.Result r = Pipeline.processBytes(md5, raw, raw.length,
+                                null, idx, s.covers, true, true, true);
                         it.kind = r.kind;
                         it.title = r.title;
                         it.artist = r.artist;
@@ -481,6 +555,10 @@ public final class Exporter {
                 if (rec != null) rec.exported = it.exported;   // 对齐缓存，免得下次列不出目录时又用错
             }
         }
+
+        List<Item> deduped = deduplicateItems(s.items);
+        s.items.clear();
+        s.items.addAll(deduped);
 
         java.util.Collections.sort(s.items, new java.util.Comparator<Item>() {
             public int compare(Item a, Item b) {
@@ -679,7 +757,9 @@ public final class Exporter {
                     r = Pipeline.processBytes(it.md5, raw, it.size > 0 ? it.size : raw.length,
                             s.sink, s.idx, s.covers, false, true, s.wantLrc);
                 } else {
-                    r = Pipeline.process(it.file, s.sink, s.idx, s.covers, false, true, s.wantLrc);
+                    byte[] raw = Index.readBytes(it.file);
+                    r = Pipeline.processBytes(it.md5, raw, raw.length,
+                            s.sink, s.idx, s.covers, false, true, s.wantLrc);
                 }
                 if (!first) report.append(",\n");
                 first = false;

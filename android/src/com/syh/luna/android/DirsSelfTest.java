@@ -66,9 +66,15 @@ public final class DirsSelfTest {
         sc = shellSyntax("readFile 命令 sh -n 通过", rcmd);
         if (sc >= 0) fail += sc;
         String hcmd = StageCmd.buildReadHeadBatch("/data/data/com.luna.music",
-                Arrays.asList("a.mdl", "../evil.mdl", "b.mdl"), StageCmd.HEAD_BYTES);
+                Arrays.asList("a.mdl", "../evil.mdl", "b.mdl",
+                        "download/3547481077455017/7704245752307140614_lossless",
+                        "download/3547481077455017/bad.tmp"),
+                StageCmd.HEAD_BYTES);
         fail += check("readHeadBatch 含 LUNA_HEAD_BEGIN", hcmd.contains("LUNA_HEAD_BEGIN"));
-        fail += check("★readHeadBatch 拒绝 ../evil.mdl", !hcmd.contains("evil.mdl"));
+        fail += check("★readHeadBatch 拒绝 ../evil.mdl 与 .tmp",
+                !hcmd.contains("evil.mdl") && !hcmd.contains("bad.tmp"));
+        fail += check("★readHeadBatch 支持 download 离线路径",
+                hcmd.contains("download/3547481077455017/7704245752307140614_lossless"));
         sc = shellSyntax("readHeadBatch 命令 sh -n 通过", hcmd);
         if (sc >= 0) fail += sc;
 
@@ -81,10 +87,13 @@ public final class DirsSelfTest {
         }
         fail += check("★buildDeleteMdl 拒绝非白名单 base", badBaseRejected);
         String dcmd = StageCmd.buildDeleteMdl("/data/data/com.luna.music",
-                Arrays.asList("abc.mdl", "../evil.mdl", "player.db", "*.mdl"));
+                Arrays.asList("abc.mdl", "../evil.mdl", "player.db", "*.mdl",
+                        "download/12345/999_lossless", "download/abc/999_lossless"));
         fail += check("★buildDeleteMdl 仅用 rm -f 不用 rm -rf",
                 dcmd.contains("rm -f ") && !dcmd.contains("rm -rf"));
         fail += check("buildDeleteMdl 同步删 .mdlnodeconf", dcmd.contains("abc.mdlnodeconf"));
+        fail += check("★buildDeleteMdl 支持合法 download 路径并过滤非数字 uid",
+                dcmd.contains("download/12345/999_lossless") && !dcmd.contains("download/abc/"));
         fail += check("★buildDeleteMdl 过滤非法文件名",
                 !dcmd.contains("evil.mdl") && !dcmd.contains("player.db") && !dcmd.contains("*.mdl"));
         sc = shellSyntax("buildDeleteMdl 命令 sh -n 通过", dcmd);

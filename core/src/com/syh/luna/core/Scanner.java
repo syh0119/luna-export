@@ -165,7 +165,12 @@ public final class Scanner {
             if (m.containsKey("encrypt_info"))
                 noteEncrypt(Json.asMap(m.get("encrypt_info")), Json.str(m, "video_id"));
             if (m.get("spade_a") instanceof String) noteEncrypt(m, null);
-            if (m.get("track") instanceof Map) noteTrack((Map<String, Object>) m.get("track"));
+            if (m.get("track") instanceof Map) {
+                noteTrack((Map<String, Object>) m.get("track"));
+            } else if (m.get("vid") instanceof String && m.get("name") instanceof String
+                    && (m.get("album") instanceof Map || m.get("artists") instanceof List)) {
+                noteTrack(m);
+            }
             if (m.get("video") instanceof Map) noteVideo((Map<String, Object>) m.get("video"));
             if (m.containsKey("video_list")) noteVideoModel(m, null);
             // file_hash = .mdl 的文件名；和同一条记录里的 track 关联后就能补出 md5→vid
@@ -217,6 +222,28 @@ public final class Scanner {
         String vid = Json.str(t, "vid");
         if (vid == null || vid.isEmpty()) return;
         if (!curVids.contains(vid)) curVids.add(vid);
+        Object idObj = t.get("id");
+        String tid = null;
+        if (idObj instanceof String) {
+            tid = ((String) idObj).trim();
+        } else if (idObj instanceof Long || idObj instanceof Integer
+                || idObj instanceof Short || idObj instanceof Byte) {
+            tid = Long.toString(((Number) idObj).longValue());
+        } else if (idObj instanceof Number) {
+            double d = ((Number) idObj).doubleValue();
+            if (!Double.isNaN(d) && !Double.isInfinite(d) && d == Math.floor(d)
+                    && d >= (double) Long.MIN_VALUE && d < 9223372036854775808.0) {
+                tid = Long.toString((long) d);
+            }
+        }
+        if (tid != null && !tid.isEmpty()) {
+            boolean allDigits = true;
+            for (int i = 0; i < tid.length(); i++) {
+                char c = tid.charAt(i);
+                if (c < '0' || c > '9') { allDigits = false; break; }
+            }
+            if (allDigits && !idx.trackId2vid.containsKey(tid)) idx.trackId2vid.put(tid, vid);
+        }
         Map<String, Object> m = idx.vidMeta.get(vid);
         if (m == null) { m = new LinkedHashMap<String, Object>(); idx.vidMeta.put(vid, m); }
 

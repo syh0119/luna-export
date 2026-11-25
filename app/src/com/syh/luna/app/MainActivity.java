@@ -59,7 +59,7 @@ public class MainActivity extends Activity {
     private final List<Exporter.Item> rows = new ArrayList<Exporter.Item>();
     private RowAdapter adapter;
 
-    private TextView chipTotal, chipReady, chipPicked, chipFilter, statMain, statSub, autoSub;
+    private TextView chipTotal, chipReady, chipPicked, chipFilter, autoSub, logToggle;
     private TextView sortAlphaBtn, sortSizeBtn, sortTimeBtn;
     private TextView logView, progressText, emptyHint, scanBtn, deleteBtn;
     private android.widget.EditText search;
@@ -69,6 +69,8 @@ public class MainActivity extends Activity {
     private ListView list;
 
     private volatile boolean busy;
+    private volatile boolean cachedRootOk;
+    private volatile boolean cachedAllFiles;
     private final StringBuilder buf = new StringBuilder();
     private boolean logOpen;
     /** false = 列表只显示能操作的（可导出/已导出）；true = 全部 .mdl */
@@ -172,8 +174,6 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         root.addView(body);
 
-        body.addView(statusCard());
-        body.addView(settingsCard());
         body.addView(chips());
         body.addView(actions());
         body.addView(searchBox());
@@ -186,11 +186,12 @@ public class MainActivity extends Activity {
         return root;
     }
 
-    /** Miuix 大标题区：无卡片、纯背景 + 30sp 粗体大标题 */
+    /** 极简单行顶栏：仅保留大标题 + 设置按钮 */
     private View header() {
         LinearLayout h = new LinearLayout(this);
-        h.setOrientation(LinearLayout.VERTICAL);
-        h.setPadding(dp(20), dp(10), dp(20), dp(6));
+        h.setOrientation(LinearLayout.HORIZONTAL);
+        h.setGravity(Gravity.CENTER_VERTICAL);
+        h.setPadding(dp(20), dp(12), dp(20), dp(8));
 
         TextView t = new TextView(this);
         t.setText("汽水导出");
@@ -198,43 +199,242 @@ public class MainActivity extends Activity {
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setLetterSpacing(-0.02f);
-        h.addView(t);
+        h.addView(t, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView s = new TextView(this);
-        s.setText(".mdl 离线解密 · 无损 FLAC / M4A / MP3 · 歌词封面内嵌");
-        s.setTextColor(SUB);
-        s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        s.setPadding(0, dp(2), 0, 0);
-        h.addView(s);
+        TextView btnSettings = new TextView(this);
+        btnSettings.setText("⚙ 设置");
+        btnSettings.setTextColor(TEXT);
+        btnSettings.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        btnSettings.setTypeface(Typeface.DEFAULT_BOLD);
+        btnSettings.setPadding(dp(12), dp(6), dp(12), dp(6));
+        btnSettings.setBackground(round(FILL, 100));
+        btnSettings.setClickable(true);
+        btnSettings.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openSettingsDialog(); }
+        });
+        h.addView(btnSettings);
         return h;
     }
 
-    private View statusCard() {
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
-        c.setPadding(dp(22), dp(2), dp(22), dp(8));
-        statMain = new TextView(this);
-        statMain.setTextColor(TEXT);
-        statMain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        statMain.setText("检测 root 状态 …");
-        c.addView(statMain);
+    private void openSettingsDialog() {
+        refreshStatus();
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(BG);
 
-        statSub = new TextView(this);
-        statSub.setTextColor(SUB);
-        statSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        statSub.setText("输出目录 /sdcard/" + Exporter.REL + "/");
-        c.addView(statSub);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(18), dp(16), dp(18), dp(14));
+        scroll.addView(root);
 
-        // 点一下去授予「所有文件访问权限」——有它才能把 .lrc 直接写在歌曲旁边
-        c.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                if (!com.syh.luna.android.MediaStoreSink.hasAllFiles(MainActivity.this)) {
-                    append("正在打开「所有文件访问权限」设置页（授予后 .lrc 会与歌曲同目录）…");
+        TextView dlgTitle = new TextView(this);
+        dlgTitle.setText("设置");
+        dlgTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        dlgTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        dlgTitle.setTextColor(TEXT);
+        dlgTitle.setPadding(0, 0, 0, dp(12));
+        root.addView(dlgTitle);
+
+        // a) 权限与状态卡片
+        LinearLayout sc = new LinearLayout(this);
+        sc.setOrientation(LinearLayout.VERTICAL);
+        sc.setBackground(round(CARD, 14));
+        sc.setPadding(dp(14), dp(12), dp(14), dp(12));
+        root.addView(sc);
+
+        boolean rootOk = cachedRootOk;
+        boolean allFilesOk = cachedAllFiles;
+
+        TextView rootTv = new TextView(this);
+        rootTv.setText(rootOk ? "✔ root 已授权" : "✘ 未获得 root 授权（请在 KernelSU / Magisk 中授权）");
+        rootTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        rootTv.setTypeface(Typeface.DEFAULT_BOLD);
+        rootTv.setTextColor(rootOk ? OK : WARN);
+        rootTv.setBackground(round(rootOk ? OKBG : WARNBG, 8));
+        rootTv.setPadding(dp(10), dp(6), dp(10), dp(6));
+        sc.addView(rootTv);
+
+        TextView filesTv = new TextView(this);
+        filesTv.setText(allFilesOk ? "✔ 所有文件访问已授权（.lrc 与歌曲同目录）"
+                : "✘ 未授权所有文件访问（点此前往授权）");
+        filesTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        filesTv.setTypeface(Typeface.DEFAULT_BOLD);
+        filesTv.setTextColor(allFilesOk ? OK : WARN);
+        filesTv.setBackground(round(allFilesOk ? OKBG : WARNBG, 8));
+        filesTv.setPadding(dp(10), dp(6), dp(10), dp(6));
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        flp.topMargin = dp(8);
+        sc.addView(filesTv, flp);
+        if (!allFilesOk) {
+            filesTv.setClickable(true);
+            filesTv.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    append("正在打开「所有文件访问权限」设置页…");
                     com.syh.luna.android.MediaStoreSink.requestAllFiles(MainActivity.this);
                 }
+            });
+        }
+
+        View div = new View(this);
+        div.setBackgroundColor(LINE);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+        dlp.topMargin = dp(10);
+        dlp.bottomMargin = dp(10);
+        sc.addView(div, dlp);
+
+        TextView metaTv = new TextView(this);
+        StringBuilder meta = new StringBuilder();
+        meta.append("输出目录：/sdcard/").append(Exporter.REL).append("/");
+        meta.append("\n版本：v").append(versionName());
+        if (session != null && session.indexInfo != null && !session.indexInfo.isEmpty()) {
+            meta.append("\n最近扫描：").append(session.indexInfo)
+                .append("（").append(session.preparedMs / 1000.0).append("s）");
+        }
+        metaTv.setText(meta.toString());
+        metaTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        metaTv.setTextColor(SUB);
+        metaTv.setLineSpacing(dp(3), 1f);
+        sc.addView(metaTv);
+
+        // b) 功能开关卡片
+        LinearLayout swCard = new LinearLayout(this);
+        swCard.setOrientation(LinearLayout.VERTICAL);
+        swCard.setBackground(round(CARD, 14));
+        swCard.setPadding(dp(14), dp(8), dp(14), dp(8));
+        LinearLayout.LayoutParams sclp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sclp.topMargin = dp(12);
+        root.addView(swCard, sclp);
+
+        autoSub = new TextView(this);
+        swCard.addView(settingRow("启动时自动增量导出", autoSub,
+                Exporter.autoOnLaunch(this),
+                new android.widget.CompoundButton.OnCheckedChangeListener() {
+                    public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
+                        Exporter.setAutoOnLaunch(MainActivity.this, v);
+                        append(v ? "⚠️ 已开启「启动时自动增量导出」" : "已关闭自动导出");
+                        refreshAutoSub();
+                    }
+                }));
+        refreshAutoSub();
+
+        View rowLine = new View(this);
+        rowLine.setBackgroundColor(LINE);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+        rlp.topMargin = dp(8);
+        rlp.bottomMargin = dp(8);
+        swCard.addView(rowLine, rlp);
+
+        TextView lrcSub = new TextView(this);
+        lrcSub.setText("歌词已内嵌在音频标签里，通常无需额外生成 .lrc");
+        swCard.addView(settingRow("额外输出 .lrc 歌词文件", lrcSub, Exporter.lrcSidecar(this),
+                new android.widget.CompoundButton.OnCheckedChangeListener() {
+                    public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
+                        Exporter.setLrcSidecar(MainActivity.this, v);
+                        append(v ? "已开启：导出时同步生成同名 .lrc" : "已关闭：只保留内嵌歌词");
+                    }
+                }));
+
+        // c) 底部说明 + su 诊断
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        footer.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams ftlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ftlp.topMargin = dp(12);
+        root.addView(footer, ftlp);
+
+        TextView descTv = new TextView(this);
+        descTv.setText(".mdl / 离线下载 CENC 离线解密导出");
+        descTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        descTv.setTextColor(SUB);
+        footer.addView(descTv, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final TextView diagBtn = new TextView(this);
+        diagBtn.setText("su 环境诊断");
+        diagBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        diagBtn.setTypeface(Typeface.DEFAULT_BOLD);
+        diagBtn.setTextColor(TEXT);
+        diagBtn.setBackground(round(FILL, 100));
+        diagBtn.setPadding(dp(12), dp(7), dp(12), dp(7));
+        diagBtn.setClickable(true);
+        footer.addView(diagBtn);
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+                .setView(scroll)
+                .setPositiveButton("关闭", null)
+                .create();
+
+        diagBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                diagBtn.setEnabled(false);
+                diagBtn.setText("诊断中…");
+                new Thread(new Runnable() {
+                    public void run() {
+                        final String res = Dirs.diagnose(MainActivity.this);
+                        runOnUiThread(new Runnable() {
+                            public void run() {
+                                if (isFinishing()) return;
+                                append("=== su 诊断 ===");
+                                append(res);
+                                logOpen = true;
+                                if (logBox != null) logBox.setVisibility(View.VISIBLE);
+                                if (logToggle != null) logToggle.setText("▾ 运行日志");
+                                if (dlg.isShowing()) dlg.dismiss();
+                            }
+                        });
+                    }
+                }, "diag").start();
             }
         });
-        return c;
+
+        dlg.show();
+    }
+
+    /** 一行「标题 + 说明 + 开关」 */
+    private View settingRow(String title, TextView subOut, boolean checked,
+                            android.widget.CompoundButton.OnCheckedChangeListener l) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout mid = new LinearLayout(this);
+        mid.setOrientation(LinearLayout.VERTICAL);
+        row.addView(mid, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextColor(TEXT);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        mid.addView(t);
+
+        if (subOut != null) {
+            subOut.setTextColor(SUB);
+            subOut.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            subOut.setPadding(0, dp(3), 0, 0);
+            mid.addView(subOut);
+        }
+
+        android.widget.Switch s = new android.widget.Switch(this);
+        s.setChecked(checked);
+        s.setShowText(false);
+        try {
+            s.setThumbTintList(new android.content.res.ColorStateList(
+                    new int[][]{{android.R.attr.state_checked}, {}},
+                    new int[]{ACCENT, dark ? 0xFF6E747E : 0xFFBFC4CC}));
+            s.setTrackTintList(new android.content.res.ColorStateList(
+                    new int[][]{{android.R.attr.state_checked}, {}},
+                    new int[]{alphaOf(ACCENT, 0.45f), dark ? 0xFF3A3A3A : 0xFFDFE2E8}));
+        } catch (Throwable ignore) { }
+        if (l != null) s.setOnCheckedChangeListener(l);
+        row.addView(s);
+        return row;
     }
 
     private View chips() {
@@ -268,112 +468,6 @@ public class MainActivity extends Activity {
         lp.rightMargin = dp(8);
         p.addView(t, lp);
         return t;
-    }
-
-    /** 操作区：主操作实心胶囊 + 次级文字胶囊 */
-    /** Miuix 开关行：启动时自动增量导出 */
-    private View settingsCard() {
-        LinearLayout c = card();
-        c.setPadding(dp(16), dp(9), dp(16), dp(9));
-
-        final TextView toggle = new TextView(this);
-        toggle.setText("▸ 设置 · 自动导出 / 歌词文件");
-        toggle.setTextColor(SUB);
-        toggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        toggle.setClickable(true);
-        c.addView(toggle);
-
-        final LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setVisibility(View.GONE);
-        box.setPadding(0, dp(6), dp(-6), 0);
-        c.addView(box);
-
-        toggle.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                boolean open = box.getVisibility() == View.GONE;
-                box.setVisibility(open ? View.VISIBLE : View.GONE);
-                toggle.setText((open ? "▾" : "▸") + " 设置 · 自动导出 / 歌词文件");
-            }
-        });
-
-        // ① 启动时自动增量导出
-        box.addView(settingRow("启动时自动增量导出", autoSub = new TextView(this),
-                Exporter.autoOnLaunch(this),
-                new android.widget.CompoundButton.OnCheckedChangeListener() {
-                    public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
-                        Exporter.setAutoOnLaunch(MainActivity.this, v);
-                        if (v) {
-                            append("⚠️ 已开启「启动时自动增量导出」：");
-                            append("   以后你在汽水音乐里新听/新下载的歌，会在打开本应用时自动落盘到");
-                            append("   /sdcard/" + Exporter.REL + "/，会持续占用空间。");
-                            append("   建议只在「集中整理歌单」期间打开。");
-                        } else {
-                            append("已关闭自动导出 —— 只有你点「导出选中」才会产出文件。");
-                        }
-                        refreshAutoSub();
-                    }
-                }));
-
-        // ② 侧车 .lrc（默认关 —— 歌词本来就内嵌在音频标签里）
-        TextView lrcSub = new TextView(this);
-        lrcSub.setText("歌词已内嵌在音频里（FLAC 的 LYRICS / M4A 的 ©lyr），"
-                + "正常播放器都能读到，通常不需要再要 .lrc 文件");
-        box.addView(settingRow("额外输出 .lrc 歌词文件", lrcSub, Exporter.lrcSidecar(this),
-                new android.widget.CompoundButton.OnCheckedChangeListener() {
-                    public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
-                        Exporter.setLrcSidecar(MainActivity.this, v);
-                        append(v ? "已开启：导出时会在歌曲旁再放一份同名 .lrc（目录里文件会翻倍）"
-                                 : "已关闭：只保留内嵌歌词，不再额外生成 .lrc");
-                    }
-                }));
-
-        refreshAutoSub();
-        return c;
-    }
-
-    /** 一行「标题 + 说明 + 开关」 */
-    private View settingRow(String title, TextView subOut, boolean checked,
-                            android.widget.CompoundButton.OnCheckedChangeListener l) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        LinearLayout mid = new LinearLayout(this);
-        mid.setOrientation(LinearLayout.VERTICAL);
-        row.addView(mid, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        TextView t = new TextView(this);
-        t.setText(title);
-        t.setTextColor(TEXT);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        mid.addView(t);
-
-        if (subOut != null) {
-            subOut.setTextColor(SUB);
-            subOut.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-            subOut.setPadding(0, dp(3), 0, 0);
-            mid.addView(subOut);
-        }
-
-        android.widget.Switch s = new android.widget.Switch(this);
-        s.setChecked(checked);
-        s.setShowText(false);
-        try {
-            // ⚠️ thumb 必须给**两个状态**的颜色。只给单一色会让「开/关」看起来一样
-            //    （Android 的 thumb 位置其实是对的，但视觉上分不出来）。
-            s.setThumbTintList(new android.content.res.ColorStateList(
-                    new int[][]{{android.R.attr.state_checked}, {}},
-                    new int[]{ACCENT, dark ? 0xFF6E747E : 0xFFBFC4CC}));
-            s.setTrackTintList(new android.content.res.ColorStateList(
-                    new int[][]{{android.R.attr.state_checked}, {}},
-                    new int[]{alphaOf(ACCENT, 0.45f), dark ? 0xFF3A3A3A : 0xFFDFE2E8}));
-        } catch (Throwable ignore) { }
-        if (l != null) s.setOnCheckedChangeListener(l);
-        row.addView(s);
-        return row;
     }
 
     private void refreshAutoSub() {
@@ -667,6 +761,7 @@ public class MainActivity extends Activity {
         c.setPadding(dp(16), dp(4), dp(16), dp(10));
 
         final TextView toggle = new TextView(this);
+        logToggle = toggle;
         toggle.setText("▸ 运行日志");
         toggle.setTextColor(SUB);
         toggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
@@ -807,7 +902,7 @@ public class MainActivity extends Activity {
 
             String st = it.state();
             h.state.setText(it.sizeText() + " · " + st);
-            if ("可导出".equals(st)) {
+            if ("可导出".equals(st) || "待导出".equals(st)) {
                 h.badge.setTextColor(OK);
                 h.badge.setBackground(round(OKBG, 8));
                 h.state.setTextColor(OK);
@@ -946,9 +1041,13 @@ public class MainActivity extends Activity {
         }
         long totalBytes = 0;
         int expCount = 0;
+        int dlCount = 0;
+        int cacheCount = 0;
         for (Exporter.Item it : chosen) {
             totalBytes += it.size;
             if (it.exported) expCount++;
+            if (it.fromDownload) dlCount++;
+            else cacheCount++;
         }
 
         LinearLayout box = new LinearLayout(this);
@@ -956,9 +1055,16 @@ public class MainActivity extends Activity {
         box.setPadding(dp(20), dp(10), dp(20), 0);
 
         TextView msg = new TextView(this);
-        msg.setText("将删除汽水音乐本地缓存中的 " + chosen.size()
-                + " 个 .mdl 及伴生配置（约释放 " + Exporter.Item.formatSize(totalBytes)
-                + "），此操作不可恢复。");
+        String scopeDesc;
+        if (dlCount > 0 && cacheCount > 0) {
+            scopeDesc = "将删除汽水音乐本地的 " + chosen.size() + " 首文件（"
+                    + dlCount + " 首离线下载、" + cacheCount + " 首播放缓存，约释放 ";
+        } else if (dlCount > 0) {
+            scopeDesc = "将删除汽水音乐离线下载中的 " + dlCount + " 首文件（约释放 ";
+        } else {
+            scopeDesc = "将删除汽水音乐本地缓存中的 " + chosen.size() + " 个 .mdl 及伴生配置（约释放 ";
+        }
+        msg.setText(scopeDesc + Exporter.Item.formatSize(totalBytes) + "），此操作不可恢复。");
         msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         box.addView(msg);
 
@@ -1119,28 +1225,9 @@ public class MainActivity extends Activity {
     private void refreshStatus() {
         new Thread(new Runnable() {
             public void run() {
-                final boolean root = Dirs.hasRoot();
-                final boolean allFiles = com.syh.luna.android.MediaStoreSink
+                cachedRootOk = Dirs.hasRoot();
+                cachedAllFiles = com.syh.luna.android.MediaStoreSink
                         .hasAllFiles(MainActivity.this);
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        String t;
-                        if (root && allFiles) {
-                            t = "✔  root + 所有文件访问：歌词直接写在歌曲旁";
-                        } else if (root) {
-                            t = "✔  root 已授权 · 点这里授予「所有文件访问」"
-                                    + "（否则 .lrc 只能落到 Download/）";
-                        } else {
-                            t = "✘  未获得 root 授权（KernelSU / Magisk 里授权本应用）";
-                        }
-                        statMain.setText(t);
-                        statMain.setTextColor(root ? TEXT : WARN);
-                        String s = "输出目录 /sdcard/" + Exporter.REL + "/";
-                        if (session != null && session.indexInfo != null && !session.indexInfo.isEmpty())
-                            s = session.indexInfo + "   ·   扫描 " + (session.preparedMs / 1000.0) + "s";
-                        statSub.setText(s);
-                    }
-                });
             }
         }, "status").start();
     }

@@ -34,6 +34,7 @@ public final class StageE2E {
         File host = new File(work, "host");
         File appFiles = new File(work, "app/files");
         new File(host, "files/music").mkdirs();
+        new File(host, "files/download/3547481077455017").mkdirs();
         new File(host, "databases").mkdirs();
         new File(host, "cache/NetCacheLoader").mkdirs();
         new File(host, "files/keva").mkdirs();
@@ -41,6 +42,8 @@ public final class StageE2E {
         write(new File(host, "files/music/a.mdl"), "MDL-A");
         write(new File(host, "files/music/b.mdl"), "MDL-B");
         write(new File(host, "files/music/中文名.mdl"), "CN");
+        write(new File(host, "files/download/3547481077455017/7704245_lossless"), "DL-FLAC");
+        write(new File(host, "files/download/3547481077455017/temp.tmp"), "TMP-SKIP");
         write(new File(host, "databases/player.db"), "SQLITE");
         write(new File(host, "cache/NetCacheLoader/c.json"), "{\"n\":1}");
         write(new File(host, "files/keva/k.sgv"), "KEVA");
@@ -108,8 +111,11 @@ public final class StageE2E {
         fail += check("目录数合理（>=1，中间层被跳过是设计）", r.dirs >= 1);
 
         // ---- 校验落点
-        fail += check("LUNA_MDL 清单含 a.mdl", text.contains(":a.mdl"));
-        fail += check("LUNA_MDL 清单含 中文名.mdl", text.contains(":中文名.mdl"));
+        fail += check("LUNA_MDL 清单含 music/a.mdl", text.contains(":music/a.mdl"));
+        fail += check("LUNA_MDL 清单含 music/中文名.mdl", text.contains(":music/中文名.mdl"));
+        fail += check("★LUNA_MDL 清单含 download/3547481077455017/7704245_lossless",
+                text.contains(":download/3547481077455017/7704245_lossless"));
+        fail += check("★LUNA_MDL 清单过滤 .tmp 临时文件", !text.contains("temp.tmp"));
         fail += check("★files_music 未被搬运到暂存区", !new File(dest, "files_music").exists());
         fail += check("databases/player.db", new File(dest, "databases/player.db").isFile());
         fail += check("cache_NetCacheLoader/c.json", new File(dest, "cache_NetCacheLoader/c.json").isFile());
@@ -117,7 +123,9 @@ public final class StageE2E {
 
         // ---- 验证批量读头与按需单文件读取
         String hp = host.getAbsolutePath().replace('\\', '/');
-        String hcmd = StageCmd.buildReadHeadBatch(hp, Arrays.asList("a.mdl", "b.mdl", "中文名.mdl"), 64);
+        String hcmd = StageCmd.buildReadHeadBatch(hp,
+                Arrays.asList("music/a.mdl", "music/b.mdl", "music/中文名.mdl",
+                        "download/3547481077455017/7704245_lossless"), 64);
         ProcessBuilder hpb = new ProcessBuilder(findSh(), "-c", hcmd);
         hpb.redirectErrorStream(false);
         Process hpProc = hpb.start();
@@ -125,11 +133,12 @@ public final class StageE2E {
         int hrc = hpProc.waitFor();
         String hStr = new String(hAll, "UTF-8");
         fail += check("批量读头退出码 0", hrc == 0);
-        fail += check("批量读头含 LUNA_HEAD_BEGIN 与 MDL-A/MDL-B/CN",
+        fail += check("批量读头含 LUNA_HEAD_BEGIN 与 MDL-A/MDL-B/CN/DL-FLAC",
                 hStr.contains("LUNA_HEAD_BEGIN") && hStr.contains("MDL-A")
-                        && hStr.contains("MDL-B") && hStr.contains("CN"));
+                        && hStr.contains("MDL-B") && hStr.contains("CN")
+                        && hStr.contains("DL-FLAC"));
 
-        String fcmd = StageCmd.buildReadFile(hp, "b.mdl");
+        String fcmd = StageCmd.buildReadFile(hp, "download/3547481077455017/7704245_lossless");
         ProcessBuilder fpb = new ProcessBuilder(findSh(), "-c", fcmd);
         fpb.redirectErrorStream(false);
         Process fpProc = fpb.start();
@@ -137,8 +146,8 @@ public final class StageE2E {
         int frc = fpProc.waitFor();
         String fStr = new String(fAll, "UTF-8");
         fail += check("单文件流读退出码 0", frc == 0);
-        fail += check("单文件流读含 LUNA_FILE_BEGIN 与 MDL-B",
-                fStr.equals(StageCmd.FILE_BEGIN + "MDL-B"));
+        fail += check("单文件流读含 LUNA_FILE_BEGIN 与 DL-FLAC",
+                fStr.equals(StageCmd.FILE_BEGIN + "DL-FLAC"));
 
         // ---- 关键：宿主目录没被改过（su 只读）
         fail += check("宿主目录没被写入", !new File(host, "luna_stage").exists());
@@ -175,10 +184,21 @@ public final class StageE2E {
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
         sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
         sb.append("for f in *.mdl *.MDL; do ");
-        sb.append("[ -f \"$f\" ] || continue; ");
+        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
         sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:%s\\n' \"$st\" \"$f\"; ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:music/%s\\n' \"$st\" \"$f\"; ");
         sb.append("done; fi; ");
+        sb.append("if cd \"$BASE/files/download\" 2>/dev/null; then ");
+        sb.append("for d in [0-9]*; do ");
+        sb.append("[ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; ");
+        sb.append("case \"$d\" in ''|*[!0-9]*) continue;; esac; ");
+        sb.append("for f in \"$d\"/*; do ");
+        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
+        sb.append("bn=${f#*/}; ");
+        sb.append("case \"$bn\" in ''|*[!0-9A-Za-z_-]*) continue;; esac; ");
+        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
+        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:download/%s\\n' \"$st\" \"$f\"; ");
+        sb.append("done; done; fi; ");
         sb.append("set --; ");
         for (String sub : StageCmd.META_SUB) {
             sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then set -- \"$@\" ")

@@ -134,6 +134,14 @@ public final class Dirs {
             this.size = size;
             this.mtimeSec = mtimeSec;
         }
+        public boolean isDownload() {
+            return name != null && name.startsWith("download/");
+        }
+        public String baseName() {
+            if (name == null) return "";
+            int i = name.lastIndexOf('/');
+            return i >= 0 ? name.substring(i + 1) : name;
+        }
     }
 
     /** 最近一次暂存扫描到的宿主 files/music/*.mdl 元清单 */

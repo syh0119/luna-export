@@ -23,6 +23,7 @@ public final class Index {
     public final Map<String, String> vid2spade = new LinkedHashMap<String, String>();
     /** md5 -> [(vid, quality)] */
     public final Map<String, List<String[]>> md5toVid = new LinkedHashMap<String, List<String[]>>();
+    public final Map<String, String> trackId2vid = new LinkedHashMap<String, String>();
     public final Map<String, Map<String, Object>> vidMeta = new LinkedHashMap<String, Map<String, Object>>();
 
     // ------------------------------------------------------------------ 载入
@@ -50,6 +51,11 @@ public final class Index {
                 }
             }
             idx.md5toVid.put(e.getKey(), arr);
+        }
+        Map<String, Object> t2v = Json.asMap(root.get("track2vid"));
+        if (t2v != null) for (Map.Entry<String, Object> e : t2v.entrySet()) {
+            String v = Json.str(e.getValue());
+            if (v != null && !v.isEmpty()) idx.trackId2vid.put(e.getKey(), v);
         }
         Map<String, Object> vm = Json.asMap(root.get("vid_meta"));
         if (vm != null) for (Map.Entry<String, Object> e : vm.entrySet()) {
@@ -136,6 +142,24 @@ public final class Index {
         return null;
     }
 
+    public static String trackIdFromKey(String key) {
+        if (key == null || key.isEmpty()) return null;
+        String s = key;
+        if (s.startsWith("dl:")) {
+            int slash = s.indexOf('/');
+            if (slash < 0 || slash + 1 >= s.length()) return null;
+            s = s.substring(slash + 1);
+        }
+        int us = s.indexOf('_');
+        String tid = us >= 0 ? s.substring(0, us) : s;
+        if (tid.length() < 5) return null;
+        for (int i = 0; i < tid.length(); i++) {
+            char c = tid.charAt(i);
+            if (c < '0' || c > '9') return null;
+        }
+        return tid;
+    }
+
     public KeyHit lookupKey(byte[] b, String md5) {
         KeyHit h = new KeyHit();
         h.kid = Mp4.kidHex(b);
@@ -162,6 +186,16 @@ public final class Index {
             h.vid = fv;
             return h;
         }
+        String tid = trackIdFromKey(md5);
+        if (tid != null) {
+            String tv = trackId2vid.get(tid);
+            if (tv != null && vid2spade.containsKey(tv)) {
+                h.spade = vid2spade.get(tv);
+                h.src = "vid:" + tv;
+                h.vid = tv;
+                return h;
+            }
+        }
         return h;
     }
 
@@ -184,6 +218,10 @@ public final class Index {
             if (vid == null) vid = lst.get(0)[0];
         }
         if (vid == null) vid = vidFromName(md5);
+        if (vid == null) {
+            String tid = trackIdFromKey(md5);
+            if (tid != null) vid = trackId2vid.get(tid);
+        }
         h.vid = vid;
         if (vid != null) {
             Map<String, Object> m = vidMeta.get(vid);
@@ -212,7 +250,8 @@ public final class Index {
             }
             sb.append(']');
         }
-        sb.append("},\n \"vid_meta\": {");
+        sb.append("},\n \"track2vid\": ").append(strMapJson(trackId2vid));
+        sb.append(",\n \"vid_meta\": {");
         f = true;
         for (Map.Entry<String, Map<String, Object>> e : vidMeta.entrySet()) {
             if (!f) sb.append(", ");

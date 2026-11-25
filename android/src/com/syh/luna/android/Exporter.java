@@ -275,7 +275,22 @@ public final class Exporter {
                 s.root = Dirs.stage(ctx);
             } catch (Exception e) {
                 s.error = "su 暂存失败: " + e.getMessage();
-                if (log != null) log.line("✗ " + s.error);
+                if (log != null) {
+                    log.line("✗ " + s.error);
+                    // 把 su 侧看到的原样带出来 —— 真机排障靠这个，别猜
+                    if (Dirs.lastTarError != null && Dirs.lastTarError.length() > 0)
+                        log.line("  tar 路径: " + Dirs.lastTarError);
+                    if (Dirs.lastSuOutput != null && Dirs.lastSuOutput.length() > 0)
+                        log.line("  su 输出: " + Dirs.lastSuOutput.replace("\n", " | "));
+                    if (Dirs.lastBase != null && Dirs.lastBase.length() > 0)
+                        log.line("  数据源: " + Dirs.lastBase
+                                + "  .mdl 数量: " + Dirs.lastCount);
+                    if (Dirs.lastStageList != null && Dirs.lastStageList.length() > 0)
+                        log.line("  打包清单: " + Dirs.lastStageList);
+                    if (Dirs.lastTarFiles > 0)
+                        log.line("  已解包: " + Dirs.lastTarFiles + " 个文件 / "
+                                + Dirs.lastTarBytes + " 字节");
+                }
                 return s;
             }
             s.staged = true;

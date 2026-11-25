@@ -6,8 +6,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.syh.luna"
-    android:versionCode="4"
-    android:versionName="1.1.3">
+    android:versionCode="5"
+    android:versionName="1.1.4">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
 

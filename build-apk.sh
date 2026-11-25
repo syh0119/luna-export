@@ -75,6 +75,7 @@ SELFTEST_OUT="$OUT/selftest"
 rm -rf "$SELFTEST_OUT"; mkdir -p "$SELFTEST_OUT"
 set +e
 "$JAVAC" -encoding UTF-8 -nowarn -d "$SELFTEST_OUT" \
+  "$ROOT/android/src/com/syh/luna/android/Tar.java" \
   "$ROOT/android/src/com/syh/luna/android/StageCmd.java" \
   "$ROOT/android/src/com/syh/luna/android/DirsSelfTest.java" > "$OUT/selftest.log" 2>&1
 if [ $? -ne 0 ]; then

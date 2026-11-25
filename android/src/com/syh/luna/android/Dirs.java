@@ -6,6 +6,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 
 /**
@@ -60,30 +61,164 @@ public final class Dirs {
     public static volatile String lastStagePath = "";
     /** 最近一次 su 侧学到的暂存目录 SELinux 上下文 */
     public static volatile String lastStageCtx = "";
+    /** 最近一次 su 报告的回执文件标签（诊断用） */
+    public static volatile String lastOkLabel = "";
+    /** 最近一次 su 报告的暂存目录标签（诊断用） */
+    public static volatile String lastDirLabel = "";
+    /** 最近一次 su 报告的暂存目录属主 uid（诊断用） */
+    public static volatile String lastOwner = "";
+    /** 最近一次 su 报告的 .mdl 数量（诊断用） */
+    public static volatile String lastCount = "";
 
     /**
-     * 独立 APK 模式：用 su 把宿主私有目录拷到**本 App 私有目录**下的暂存区。
+     * 独立 APK 模式：把宿主私有数据暂存到**本 App 私有目录**下。
+     *
+     * ── v1.1.4：两条路径 ─────────────────────────────────────────────
+     *
+     * **主路径（tar 流）**：su 只**读**宿主数据、打成 tar 吐到 stdout，
+     *   App 自己解包进自己的目录。文件全部由 App 创建 →
+     *   属主天然正确、SELinux 标签由内核按创建者域自动继承 → 天然正确。
+     *   完全不需要 chown / chcon / restorecon，也不要求 su 与 App
+     *   共享同一个挂载命名空间。
+     *
+     * **兜底路径（cp）**：设备上没有 tar 时才用。让 su 直接把数据拷进
+     *   本 App 的目录，靠 chown + chcon/restorecon 掰回属主与标签。
      *
      * ⚠️ 坑 1（挂载命名空间）：从应用发起的 su 可能落在**应用自己的挂载命名空间**里，
-     *    那里 /data 有时是个 stub（root 被换成 erofs 模块视图），
-     *    真正的数据只能用 init 的 root 去看：/proc/1/root/data/data/<pkg>。
-     *    所以这里先试直接路径，不行就自动切到 /proc/1/root。
+     *    那里 /data 有时是个 stub，真正的数据只能用 init 的 root 去看：/proc/1/root/data/data/<pkg>。
+     *    所以两个候选都试，且按 **files/music 的内容数量**择优（不是看存不存在）。
      *
-     * ⚠️ 坑 2（su 与 App 是否看得到同一个目录）：su 是 App 的子进程，继承 App 的
+     * ⚠️ 坑 2（属主 + SELinux 标签 —— v1.1.4 修的真机致命 bug）：
+     *    拷过来的文件默认属主是宿主 App 的 uid、标签是宿主 App 的
+     *    （app_data_file:s0:cXXX,cYYY，XXX 是宿主 uid），本 App **一个字节都读不到**。
+     *    必须把属主 chown 回本 App、标签 chcon/restorecon 回本 App 的 MCS 类别。
+     *    而且**回执文件必须在 chown 之前写**，否则它属主是 root、mode 600，
+     *    App 连自己的回执都读不到 → 误报「暂存区不可见」。
+     *
+     * ⚠️ 坑 3（su 与 App 是否看得到同一个目录）：su 是 App 的子进程，继承 App 的
      *    挂载命名空间，但不同 Root 方案行为不完全一样。所以**不猜路径** ——
      *    App 先在私有目录里写一个带随机标记的探针文件，再让 su 逐个候选路径 grep 这个标记，
      *    能看到的那个就是同一个真实目录。**一个都看不到就直接报错，绝不执行删除**。
-     *
-     * ⚠️ 坑 3（属主与 SELinux 标签）：拷过来的文件属主是宿主 App 的 uid、SELinux 标签
-     *    也是宿主 App 的（本 App 读不了）。所以拷完统一 chown 回本 App 的 uid，
-     *    并把 SELinux 上下文改回本 App 自己的（从探针文件上读出来，不猜）。
      */
     public static File stage(Context ctx) throws IOException {
+        // ============ 主路径：tar 流 ============
+        String tarStyle = StageCmd.detectTar();
+        if (tarStyle != null && tarStyle.length() > 0) {
+            try {
+                return stageViaTar(ctx, tarStyle);
+            } catch (IOException e) {
+                lastTarError = String.valueOf(e.getMessage());
+                // tar 路径失败不致命 —— 退回 cp 兜底
+            }
+        } else {
+            lastTarError = "设备上没有 tar";
+        }
+
+        // ============ 兜底路径：cp ============
+        return stageViaCopy(ctx);
+    }
+
+    /** tar 路径失败的原因（诊断用） */
+    public static volatile String lastTarError = "";
+    /** tar 路径解出的文件数（诊断用） */
+    public static volatile int lastTarFiles = 0;
+    /** tar 路径解出的总字节（诊断用） */
+    public static volatile long lastTarBytes = 0;
+    /** tar 路径实际打包的子目录清单（诊断用） */
+    public static volatile String lastStageList = "";
+
+    /**
+     * tar 流路径：su 只读，App 自己解包。
+     */
+    static File stageViaTar(Context ctx, String tarStyle) throws IOException {
+        File dest = stageDir(ctx);
+        if (!dest.isDirectory() && !dest.mkdirs() && !dest.isDirectory()) {
+            throw new IOException("无法创建暂存目录: " + dest);
+        }
+        // 清空上一次残留（纯 Java，不需要 root）
+        cleanup(dest);
+
+        String cmd = StageCmd.buildTar(tarStyle);
+        Process p = null;
+        InputStream in = null;
+        try {
+            p = new ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start();
+            in = p.getInputStream();
+
+            // ---- 先读文本诊断，直到遇到 LUNA_TAR_BEGIN 标记
+            //      逐字节读，不多读 —— 标记之后紧跟着的就是二进制 tar 数据
+            StringBuilder head = new StringBuilder();
+            int ch;
+            boolean found = false;
+            while ((ch = in.read()) >= 0) {
+                head.append((char) ch);
+                if (head.length() > 8192) break;      // 诊断不该这么长
+                String h = head.toString();
+                int bi = h.indexOf(StageCmd.TAR_BEGIN);
+                if (bi >= 0) {
+                    found = true;
+                    lastSuOutput = h.substring(0, bi);   // 标记之前全是文本诊断
+                    break;
+                }
+            }
+            if (!found) {
+                throw new IOException("su 输出里没有 tar 流标记（su 侧输出："
+                        + head.toString().trim() + "）");
+            }
+
+            // ---- 解析文本诊断
+            lastBase = field(lastSuOutput, "LUNA_BASE=");
+            lastCount = field(lastSuOutput, "LUNA_COUNT=");
+            lastStageList = field(lastSuOutput, "LUNA_LIST=");
+            if (lastSuOutput.contains("LUNA_NO_BASE")) {
+                throw new IOException("su 读不到宿主私有目录（两个候选路径都没有内容）");
+            }
+            if (lastSuOutput.contains("LUNA_NO_LIST")) {
+                throw new IOException("宿主私有目录里一个目标子目录都没有（列表为空）");
+            }
+
+            // ---- 解包：文件全部由 App 创建，属主与标签天然正确
+            // ⚠️ 传 SUB 清单做精确前缀映射：files/music/x.mdl → files_music/x.mdl
+            Tar.Result tr = Tar.extract(in, dest, StageCmd.SUB);
+            lastTarFiles = tr.files;
+            lastTarBytes = tr.bytes;
+
+            int rc;
+            try {
+                rc = p.waitFor();
+            } catch (InterruptedException ie) {
+                rc = -1;
+                Thread.currentThread().interrupt();
+            }
+            lastSuCode = rc;
+            if (tr.files == 0) {
+                throw new IOException("tar 解包出来 0 个文件（su 退出码 " + rc + "）");
+            }
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignore) { }
+            if (p != null) p.destroy();
+        }
+
+        // ---- 校验：App 自己写的目录，App 一定看得见
+        File music = new File(dest, "files_music");
+        if (!music.isDirectory()) {
+            throw new IOException("解包后没有 files_music 目录（暂存区结构不对）");
+        }
+        return dest;
+    }
+
+    /**
+     * cp 兜底路径：让 su 直接把数据拷进本 App 的目录。
+     */
+    static File stageViaCopy(Context ctx) throws IOException {
         File dest = stageDir(ctx);
         File filesDir = dest.getParentFile();          // /data/user/0/com.syh.luna/files
         String filesPath = filesDir.getAbsolutePath();
 
-        // ---- 探针：写在**暂存目录的父目录**里（不能写在 dest 里，否则后面的 rm -rf 会把它删掉）
+        // ---- 探针：写在**暂存目录的父目录**与**暂存目录内部**两处
+        //   父目录那份用于「su 能不能看到 App 的私有目录」；
+        //   目录内那份用于「学 SELinux 标签」（暂存目录的标签就是 App 创建时的正确标签），
+        //   并且必须在清空目录**之前**写、且清空时要排除它 —— 见下方命令里的保留逻辑。
         String probe = ".luna_probe_" + Long.toHexString(System.nanoTime());
         String marker = "LUNA_PROBE_" + Long.toHexString(System.nanoTime());
         String token = "LUNA_OK_" + Long.toHexString(System.nanoTime());
@@ -94,13 +229,20 @@ public final class Dirs {
             try { o.write(marker.getBytes("UTF-8")); } finally { o.close(); }
             pf.setReadable(true, false);          // 任何 su 域都要读得到，否则探针失灵
             pf.setWritable(true, false);
+            // 暂存目录内的探针（标签样本）
+            dest.mkdirs();
+            File pf2 = new File(dest, probe);
+            FileOutputStream o2 = new FileOutputStream(pf2);
+            try { o2.write(marker.getBytes("UTF-8")); } finally { o2.close(); }
+            pf2.setReadable(true, false);
         } catch (Throwable ignore) { }
 
-        String cmd = StageCmd.build(filesPath, probe, marker, token,
+        String cmd = StageCmd.buildCopy(filesPath, probe, marker, token,
                 android.os.Process.myUid());
         String out = su(cmd);
         lastSuOutput = out;
         try { new File(filesDir, probe).delete(); } catch (Throwable ignore) { }
+        try { new File(dest, probe).delete(); } catch (Throwable ignore) { }
         if (out == null) throw new IOException("su 无法执行（未安装 su？）");
         if (out.indexOf("NO_PROBE") >= 0) {
             throw new IOException("su 看不到本 App 的私有目录（探针未命中）—— "
@@ -122,19 +264,40 @@ public final class Dirs {
             int j = out.indexOf('\n', i);
             lastStageCtx = j > i ? out.substring(i + 10, j).trim() : "";
         }
+        lastOkLabel = field(out, "OKLABEL=");
+        lastDirLabel = field(out, "DIRLABEL=");
+        lastOwner = field(out, "OWNER=");
+        lastCount = field(out, "COUNT=");
 
         // ---- 回读校验：App 侧必须真的能看到 su 写出来的东西
         File ok = new File(dest, ".luna_ok");
         boolean seen = false;
+        String why = "";
         try {
             FileInputStreamHelper.read(ok, token);
             seen = true;
-        } catch (Throwable ignore) { }
+        } catch (Throwable t) {
+            why = String.valueOf(t.getMessage());
+        }
         if (!seen) {
             throw new IOException("暂存区不可见（su 侧路径 " + lastStagePath
-                    + "，上下文 " + lastStageCtx + "）—— su 与本 App 不在同一个 /data 视图上");
+                    + "，上下文 " + lastStageCtx
+                    + "，回执标签 " + lastOkLabel
+                    + "，目录标签 " + lastDirLabel
+                    + "，属主 " + lastOwner
+                    + "，文件数 " + lastCount
+                    + "）—— " + why);
         }
         return dest;
+    }
+
+    /** 从 su 输出里取 KEY=VALUE 的值（取到行尾或下一个已知键前） */
+    static String field(String out, String key) {
+        if (out == null) return "";
+        int i = out.indexOf(key);
+        if (i < 0) return "";
+        int j = out.indexOf('\n', i);
+        return (j > i ? out.substring(i + key.length(), j) : out.substring(i + key.length())).trim();
     }
 
     /** 暂存目录是否还在（导出期间可能被清理过，需要重新暂存） */
@@ -209,6 +372,7 @@ public final class Dirs {
         String cmd =
                 "echo '[id]'; id 2>&1; "
               + "echo '[ns]'; readlink /proc/self/ns/mnt; readlink /proc/1/ns/mnt; "
+              + "echo '[tar]'; command -v tar 2>&1; "
               + "echo '[A direct]'; ls -ld " + A + " 2>&1; "
               + "echo '[B proc1 ]'; ls -ld " + B + " 2>&1; "
               + "echo '[B music ]'; ls " + B + "/files/music 2>&1 | wc -l; "

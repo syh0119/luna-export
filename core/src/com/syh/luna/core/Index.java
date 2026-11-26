@@ -7,11 +7,13 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * 索引（kid->spade_a / vid->spade_a / md5->vid / vid->元数据）与封面查找。
@@ -25,6 +27,90 @@ public final class Index {
     public final Map<String, List<String[]>> md5toVid = new LinkedHashMap<String, List<String[]>>();
     public final Map<String, String> trackId2vid = new LinkedHashMap<String, String>();
     public final Map<String, Map<String, Object>> vidMeta = new LinkedHashMap<String, Map<String, Object>>();
+
+    /** 合并另一个分片索引（字段级安全合并，不覆盖已有非空字段；隔离共享 Map 引用） */
+    public void merge(Index other) {
+        if (other == null || other == this) return;
+        mergeStringMap(this.kid2spade, other.kid2spade);
+        mergeStringMap(this.vid2spade, other.vid2spade);
+        mergeStringMap(this.trackId2vid, other.trackId2vid);
+        mergeMd5ToVid(this.md5toVid, other.md5toVid);
+        mergeVidMeta(this.vidMeta, other.vidMeta);
+    }
+
+    private static void mergeStringMap(Map<String, String> target, Map<String, String> source) {
+        if (target == null || source == null || source.isEmpty()) return;
+        for (Map.Entry<String, String> e : source.entrySet()) {
+            String k = e.getKey();
+            String v = e.getValue();
+            if (k == null || k.isEmpty() || v == null || v.isEmpty()) continue;
+            String existing = target.get(k);
+            if (existing == null || existing.isEmpty()) {
+                target.put(k, v);
+            }
+        }
+    }
+
+    private static void mergeMd5ToVid(Map<String, List<String[]>> target, Map<String, List<String[]>> source) {
+        if (target == null || source == null || source.isEmpty()) return;
+        for (Map.Entry<String, List<String[]>> e : source.entrySet()) {
+            String md5 = e.getKey();
+            List<String[]> srcList = e.getValue();
+            if (md5 == null || md5.isEmpty() || srcList == null || srcList.isEmpty()) continue;
+            TreeMap<String, String[]> dedupSorted = new TreeMap<String, String[]>();
+            List<String[]> curList = target.get(md5);
+            if (curList != null) addMd5Pairs(dedupSorted, curList);
+            addMd5Pairs(dedupSorted, srcList);
+            target.put(md5, new ArrayList<String[]>(dedupSorted.values()));
+        }
+    }
+
+    private static void addMd5Pairs(TreeMap<String, String[]> out, List<String[]> list) {
+        for (int i = 0; i < list.size(); i++) {
+            String[] p = list.get(i);
+            if (p == null || p.length == 0 || p[0] == null) continue;
+            String vid = p[0];
+            String q = p.length > 1 && p[1] != null ? p[1] : "";
+            String key = vid + "\u0000" + q;
+            if (!out.containsKey(key)) {
+                out.put(key, new String[]{vid, q});
+            }
+        }
+    }
+
+    private static void mergeVidMeta(Map<String, Map<String, Object>> target,
+                                     Map<String, Map<String, Object>> source) {
+        if (target == null || source == null || source.isEmpty()) return;
+        for (Map.Entry<String, Map<String, Object>> e : source.entrySet()) {
+            String vid = e.getKey();
+            Map<String, Object> srcMap = e.getValue();
+            if (vid == null || vid.isEmpty() || srcMap == null || srcMap.isEmpty()) continue;
+            Map<String, Object> cur = target.get(vid);
+            if (cur == null) {
+                target.put(vid, new LinkedHashMap<String, Object>(srcMap));
+            } else {
+                // Scanner.linkHashes 会让多个 vid 共享同一个 Map，必须拷贝隔离后再合并字段
+                Map<String, Object> merged = new LinkedHashMap<String, Object>(cur);
+                target.put(vid, merged);
+                for (Map.Entry<String, Object> fe : srcMap.entrySet()) {
+                    String fk = fe.getKey();
+                    Object fv = fe.getValue();
+                    if (fk == null || fk.isEmpty() || !isNonEmptyMetaVal(fv)) continue;
+                    if (!isNonEmptyMetaVal(merged.get(fk))) {
+                        merged.put(fk, fv);
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean isNonEmptyMetaVal(Object v) {
+        if (v == null) return false;
+        if (v instanceof String) return !((String) v).isEmpty();
+        if (v instanceof Map) return !((Map<?, ?>) v).isEmpty();
+        if (v instanceof Collection) return !((Collection<?>) v).isEmpty();
+        return true;
+    }
 
     // ------------------------------------------------------------------ 载入
     @SuppressWarnings("unchecked")

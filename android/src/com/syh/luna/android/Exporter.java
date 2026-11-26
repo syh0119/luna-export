@@ -364,10 +364,29 @@ public final class Exporter {
         return out;
     }
 
+    private static final class ProbeTask {
+        final Item item;
+        final String md5;
+        final String sig;
+        final boolean isNew;
+        final Dirs.MdlEntry entry;
+        final File file;
+
+        ProbeTask(Item item, String md5, String sig, boolean isNew, Dirs.MdlEntry entry, File file) {
+            this.item = item;
+            this.md5 = md5;
+            this.sig = sig;
+            this.isNew = isNew;
+            this.entry = entry;
+            this.file = file;
+        }
+    }
+
     // ------------------------------------------------------------------ 准备
-    public static Session prepare(Context ctx, boolean rootMode, Log log, Progress prog) {
+    public static Session prepare(final Context ctx, final boolean rootMode, Log log, final Progress prog) {
         long t0 = System.currentTimeMillis();
-        Session s = new Session();
+        long tStageStart = t0;
+        final Session s = new Session();
         s.ctx = ctx;
 
         List<Dirs.MdlEntry> stagedEntries = null;
@@ -431,14 +450,16 @@ public final class Exporter {
                 return s;
             }
         }
+        long stageMs = System.currentTimeMillis() - tStageStart;
 
-        int totalCount = rootMode ? stagedEntries.size() : files.size();
+        final int totalCount = rootMode ? stagedEntries.size() : files.size();
         s.stateFile = stateFileFor(ctx, rootMode, s.root);
         s.state = State.load(s.stateFile);
         s.wantLrc = lrcSidecar(ctx);        // 默认 false：歌词已内嵌，不额外丢 .lrc
 
-        if (prog != null) prog.on(0, 0, "解析曲目与密钥索引（" + totalCount + " 个文件）…");
-        Index idx = IndexBuilder.build(s.root, s.staged);
+        long tIndexStart = System.currentTimeMillis();
+        if (prog != null) prog.on(0, 0, "并发解析曲目与密钥索引（" + totalCount + " 个文件）…");
+        final Index idx = IndexBuilder.build(s.root, s.staged);
         File vault = rootMode ? KeyVault.inStage(s.root) : KeyVault.inHost(s.root);
         s.vaultKeys = KeyVault.apply(idx, vault);
         s.idx = idx;
@@ -449,99 +470,66 @@ public final class Exporter {
         if (s.staged) {
             Dirs.cleanup(s.root);
         }
+        long indexMs = System.currentTimeMillis() - tIndexStart;
 
+        long tProbeStart = System.currentTimeMillis();
         s.covers = new CoverStore(ctx);
-        int i = 0, probed = 0;
+        final List<ProbeTask> pendingTasks = new ArrayList<ProbeTask>();
+        int cachedHits = 0;
 
         if (rootMode) {
             List<String> needHeads = new ArrayList<String>();
             for (Dirs.MdlEntry e : stagedEntries) {
                 String md5 = cacheKeyForRel(e.name);
-                String sig = sigOf(e.size, e.mtimeSec * 1000L);
-                FileRec cached = s.state.files.get(md5);
-                if (cached == null || !sig.equals(cached.sig)) {
-                    needHeads.add(e.name);
-                }
-            }
-            if (!needHeads.isEmpty() && prog != null) {
-                prog.on(0, 0, "读取 " + needHeads.size() + " 首新曲目头部 …");
-            }
-            Map<String, byte[]> heads = needHeads.isEmpty()
-                    ? java.util.Collections.<String, byte[]>emptyMap()
-                    : Dirs.readHostMdlHeads(s.base, needHeads, StageCmd.HEAD_BYTES);
-
-            for (Dirs.MdlEntry e : stagedEntries) {
-                String md5 = cacheKeyForRel(e.name);
                 Item it = new Item(null, e.name, md5, e.size, e.mtimeSec * 1000L);
+                s.items.add(it);
                 String sig = sigOf(e.size, e.mtimeSec * 1000L);
                 FileRec cached = s.state.files.get(md5);
                 if (cached != null && sig.equals(cached.sig)) {
                     applyCachedRec(it, cached, idx);
+                    cachedHits++;
                 } else {
-                    it.changed = true;
-                    probed++;
-                    try {
-                        byte[] head = heads.get(e.name);
-                        if (head == null && e.size > 0) {
-                            head = Dirs.readHostMdl(s.base, e.name, e.size);
-                        } else if (head != null && !Pipeline.hasCompleteMp4Head(head) && e.size > head.length) {
-                            head = Dirs.readHostMdl(s.base, e.name, e.size);
-                        }
-                        Pipeline.Result r = Pipeline.processBytes(md5, head, e.size,
-                                null, idx, s.covers, true, true, true);
-                        it.kind = r.kind;
-                        it.title = r.title;
-                        it.artist = r.artist;
-                        it.album = r.album;
-                        it.complete = r.complete;
-                        it.hasKey = isKey(r);
-                        it.kid = r.kid;
-                    } catch (Throwable t) {
-                        it.kind = "junk";
-                    }
-                    if (cached == null) s.newCount++;
-                    saveItemRec(s.state, it, sig);
+                    needHeads.add(e.name);
+                    pendingTasks.add(new ProbeTask(it, md5, sig, cached == null, e, null));
                 }
-                s.items.add(it);
-                i++;
-                if (prog != null) prog.on(i, totalCount, "扫描 " + i + "/" + totalCount);
             }
+            if (!needHeads.isEmpty() && prog != null) {
+                prog.on(cachedHits, totalCount, "读取 " + needHeads.size() + " 首新曲目头部 …");
+            }
+            final Map<String, byte[]> heads = needHeads.isEmpty()
+                    ? java.util.Collections.<String, byte[]>emptyMap()
+                    : Dirs.readHostMdlHeads(s.base, needHeads, StageCmd.HEAD_BYTES);
+
+            runProbeTasks(pendingTasks, totalCount, cachedHits, prog, true, s, idx, heads);
         } else {
             for (int fi = 0; fi < files.size(); fi++) {
                 File f = files.get(fi);
                 String rel = localRels.get(fi);
                 String md5 = cacheKeyForRel(rel);
                 Item it = new Item(f, rel, md5, f.length(), f.lastModified());
+                s.items.add(it);
                 String sig = sigOf(f);
                 FileRec cached = s.state.files.get(md5);
                 if (cached != null && sig.equals(cached.sig)) {
                     applyCachedRec(it, cached, idx);
+                    cachedHits++;
                 } else {
-                    it.changed = true;
-                    probed++;
-                    try {
-                        byte[] raw = Index.readBytes(f);
-                        Pipeline.Result r = Pipeline.processBytes(md5, raw, raw.length,
-                                null, idx, s.covers, true, true, true);
-                        it.kind = r.kind;
-                        it.title = r.title;
-                        it.artist = r.artist;
-                        it.album = r.album;
-                        it.complete = r.complete;
-                        it.hasKey = isKey(r);
-                        it.kid = r.kid;
-                    } catch (Throwable t) {
-                        it.kind = "junk";
-                    }
-                    if (cached == null) s.newCount++;
-                    saveItemRec(s.state, it, sig);
+                    pendingTasks.add(new ProbeTask(it, md5, sig, cached == null, null, f));
                 }
-                s.items.add(it);
-                i++;
-                if (prog != null) prog.on(i, totalCount, "扫描 " + i + "/" + totalCount);
             }
+            runProbeTasks(pendingTasks, totalCount, cachedHits, prog, false, s, idx, null);
         }
-        s.changedCount = probed;
+
+        for (int ti = 0; ti < pendingTasks.size(); ti++) {
+            ProbeTask t = pendingTasks.get(ti);
+            if (t.isNew) s.newCount++;
+            saveItemRec(s.state, t.item, t.sig);
+        }
+        s.changedCount = pendingTasks.size();
+        if (pendingTasks.isEmpty() && prog != null) {
+            prog.on(totalCount, totalCount, "扫描 " + totalCount + "/" + totalCount);
+        }
+        long probeMs = System.currentTimeMillis() - tProbeStart;
 
         // ---- 「已导出」以输出目录里的**真实文件**为准
         // state.json 只是「我曾经导出过」的记忆；用户删文件/清存储/换机之后它就是错的。
@@ -589,9 +577,92 @@ public final class Exporter {
             log.line("扫描 " + s.items.size() + " 个 .mdl：新增 " + s.newCount
                     + " · 有变化 " + s.changedCount + " · 可导出 " + s.countExportable()
                     + "（读盘 " + s.changedCount + " 个，其余走缓存，"
-                    + s.preparedMs / 1000.0 + "s）");
+                    + String.format(java.util.Locale.US, "%.2fs", s.preparedMs / 1000.0)
+                    + " [暂存 " + String.format(java.util.Locale.US, "%.2fs", stageMs / 1000.0)
+                    + " · 索引 " + String.format(java.util.Locale.US, "%.2fs", indexMs / 1000.0)
+                    + " · 体检 " + String.format(java.util.Locale.US, "%.2fs", probeMs / 1000.0)
+                    + "]）");
         }
         return s;
+    }
+
+    private static void probeSingle(ProbeTask task, boolean rootMode, Session s, Index idx,
+                                    Map<String, byte[]> heads) {
+        Item it = task.item;
+        it.changed = true;
+        try {
+            byte[] raw;
+            long realSize;
+            if (rootMode) {
+                Dirs.MdlEntry e = task.entry;
+                realSize = e.size;
+                byte[] head = heads.get(e.name);
+                if (head == null && e.size > 0) {
+                    head = Dirs.readHostMdl(s.base, e.name, e.size);
+                } else if (head != null && !Pipeline.hasCompleteMp4Head(head) && e.size > head.length) {
+                    head = Dirs.readHostMdl(s.base, e.name, e.size);
+                }
+                raw = head;
+            } else {
+                raw = Index.readBytes(task.file);
+                realSize = raw.length;
+            }
+            Pipeline.Result r = Pipeline.processBytes(task.md5, raw, realSize,
+                    null, idx, s.covers, true, true, true);
+            it.kind = r.kind;
+            it.title = r.title;
+            it.artist = r.artist;
+            it.album = r.album;
+            it.complete = r.complete;
+            it.hasKey = isKey(r);
+            it.kid = r.kid;
+        } catch (Throwable t) {
+            it.kind = "junk";
+        }
+    }
+
+    private static void runProbeTasks(final List<ProbeTask> tasks, final int totalCount,
+                                      int cachedHits, final Progress prog, final boolean rootMode,
+                                      final Session s, final Index idx, final Map<String, byte[]> heads) {
+        if (tasks.isEmpty()) return;
+        final java.util.concurrent.atomic.AtomicInteger done =
+                new java.util.concurrent.atomic.AtomicInteger(cachedHits);
+        if (tasks.size() == 1) {
+            probeSingle(tasks.get(0), rootMode, s, idx, heads);
+            int c = done.incrementAndGet();
+            if (prog != null) prog.on(c, totalCount, "扫描 " + c + "/" + totalCount);
+            return;
+        }
+        int threads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors()));
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        final java.util.concurrent.atomic.AtomicInteger cursor = new java.util.concurrent.atomic.AtomicInteger(0);
+        try {
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<java.util.concurrent.Future<?>>(threads);
+            for (int t = 0; t < threads; t++) {
+                futures.add(pool.submit(new java.util.concurrent.Callable<Void>() {
+                    public Void call() {
+                        while (!Thread.currentThread().isInterrupted()) {
+                            int idxTask = cursor.getAndIncrement();
+                            if (idxTask >= tasks.size()) break;
+                            probeSingle(tasks.get(idxTask), rootMode, s, idx, heads);
+                            int c = done.incrementAndGet();
+                            if (prog != null) prog.on(c, totalCount, "扫描 " + c + "/" + totalCount);
+                        }
+                        return null;
+                    }
+                }));
+            }
+            for (int t = 0; t < futures.size(); t++) {
+                try {
+                    futures.get(t).get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Throwable ignore) { }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     private static void applyCachedRec(Item it, FileRec cached, Index idx) {

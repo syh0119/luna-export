@@ -114,6 +114,7 @@ public final class Dirs {
             try {
                 return stageViaTar(ctx, tarStyle);
             } catch (IOException e) {
+                StageCmd.resetTarCache();
                 lastTarError = String.valueOf(e.getMessage());
                 // tar 路径失败不致命 —— 退回 cp 兜底
             }
@@ -481,6 +482,8 @@ public final class Dirs {
                 long sz = Long.parseLong(rest.substring(0, c1));
                 long mt = Long.parseLong(rest.substring(c1 + 1, c2));
                 String nm = rest.substring(c2 + 1);
+                if (nm.startsWith("music/./")) nm = "music/" + nm.substring(8);
+                else if (nm.startsWith("download/./")) nm = "download/" + nm.substring(11);
                 if (!nm.isEmpty()) list.add(new MdlEntry(nm, sz, mt));
             } catch (NumberFormatException ignore) { }
         }
@@ -586,7 +589,7 @@ public final class Dirs {
               + "echo '[B net   ]'; ls " + B + "/cache/NetCacheLoader 2>&1 | head -3; "
               + "echo '[B net2  ]'; ls " + B + "/files/NetCacheLoader 2>&1 | head -3; "
               + "echo '[B keva  ]'; ls " + B + "/files/keva 2>&1 | head -3; "
-              + "echo '[stage  ]'; ls -ld " + (stage == null ? "-" : stage.getAbsolutePath()) + " 2>&1";
+              + "echo '[stage  ]'; " + (stage == null ? "echo '-'" : ("if [ -d " + StageCmd.q(stage.getAbsolutePath()) + " ]; then ls -ld " + StageCmd.q(stage.getAbsolutePath()) + " 2>&1; else echo '(已清理/无残留)'; fi"));
         String out = su(cmd);
         return "su 退出码 " + lastSuCode + "\n" + (out == null ? "(su 无法执行)" : out);
     }

@@ -53,8 +53,13 @@ public final class StageCmd {
     public static final String HEAD_BEGIN = "LUNA_HEAD_BEGIN\n";
     /** 单文件流读取的分隔标记 */
     public static final String FILE_BEGIN = "LUNA_FILE_BEGIN\n";
-    /** 扫描体检读取的单个 .mdl 头部上限（512 KB，覆盖真机 MP4 moov） */
-    public static final int HEAD_BYTES = 512 * 1024;
+    /** 扫描体检读取的单个 .mdl 头部上限（128 KB，覆盖 99%+ 真机 MP4 moov，不足时按需回退全文件） */
+    public static final int HEAD_BYTES = 128 * 1024;
+    private static volatile String cachedTarStyle;
+
+    static void resetTarCache() {
+        cachedTarStyle = null;
+    }
 
     /**
      * 需要暂存的数据子路径。
@@ -89,12 +94,20 @@ public final class StageCmd {
      * @return "tar" / "busybox tar" / ""（没有）
      */
     public static String detectTar() {
+        String cached = cachedTarStyle;
+        if (cached != null) return cached;
         String out = run("if command -v tar >/dev/null 2>&1; then echo HAS_TAR; fi; "
                 + "if command -v busybox >/dev/null 2>&1; then "
                 + "if busybox 2>&1 | tr ' ' '\\n' | grep -qx tar; then echo HAS_BUSYBOX_TAR; fi; fi;");
         if (out == null) return "";
-        if (out.contains("HAS_TAR")) return "tar";
-        if (out.contains("HAS_BUSYBOX_TAR")) return "busybox tar";
+        if (out.contains("HAS_TAR")) {
+            cachedTarStyle = "tar";
+            return "tar";
+        }
+        if (out.contains("HAS_BUSYBOX_TAR")) {
+            cachedTarStyle = "busybox tar";
+            return "busybox tar";
+        }
         return "";
     }
 
@@ -246,24 +259,16 @@ public final class StageCmd {
         return sb.toString();
     }
 
-    private static void appendEnumerateMdl(StringBuilder sb) {
+    static void appendEnumerateMdl(StringBuilder sb) {
         sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
-        sb.append("for f in *.mdl *.MDL; do ");
-        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
-        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:music/%s\\n' \"$st\" \"$f\"; ");
-        sb.append("done; fi; ");
+        sb.append("find . -maxdepth 1 -type f \\( -name '*.mdl' -o -name '*.MDL' \\) -exec stat -c 'LUNA_MDL=%s:%Y:music/%n' {} + 2>/dev/null | sed 's|:music/\\./|:music/|'; ");
+        sb.append("fi; ");
         sb.append("if cd \"$BASE/files/download\" 2>/dev/null; then ");
         sb.append("for d in [0-9]*; do ");
         sb.append("[ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; ");
         sb.append("case \"$d\" in ''|*[!0-9]*) continue;; esac; ");
-        sb.append("for f in \"$d\"/*; do ");
-        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
-        sb.append("bn=${f#*/}; ");
-        sb.append("case \"$bn\" in ''|*[!0-9A-Za-z_-]*) continue;; esac; ");
-        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:download/%s\\n' \"$st\" \"$f\"; ");
-        sb.append("done; done; fi; ");
+        sb.append("find \"$d\" -maxdepth 1 -type f -exec stat -c 'LUNA_MDL=%s:%Y:download/%n' {} + 2>/dev/null | grep -E '^LUNA_MDL=[0-9]+:[0-9]+:download/[0-9]+/[0-9A-Za-z_-]+$'; ");
+        sb.append("done; fi; ");
     }
 
     static String normalizeRel(String relOrName) {

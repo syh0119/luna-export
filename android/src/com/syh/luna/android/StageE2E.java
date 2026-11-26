@@ -182,23 +182,7 @@ public final class StageE2E {
         sb.append("if [ -z \"$BASE\" ]; then echo 'LUNA_NO_BASE'; exit 7; fi; ");
         sb.append("echo \"LUNA_BASE=$BASE\"; ");
         sb.append("echo \"LUNA_COUNT=$BEST\"; ");
-        sb.append("if cd \"$BASE/files/music\" 2>/dev/null; then ");
-        sb.append("for f in *.mdl *.MDL; do ");
-        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
-        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:music/%s\\n' \"$st\" \"$f\"; ");
-        sb.append("done; fi; ");
-        sb.append("if cd \"$BASE/files/download\" 2>/dev/null; then ");
-        sb.append("for d in [0-9]*; do ");
-        sb.append("[ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; ");
-        sb.append("case \"$d\" in ''|*[!0-9]*) continue;; esac; ");
-        sb.append("for f in \"$d\"/*; do ");
-        sb.append("[ -f \"$f\" ] && [ ! -L \"$f\" ] || continue; ");
-        sb.append("bn=${f#*/}; ");
-        sb.append("case \"$bn\" in ''|*[!0-9A-Za-z_-]*) continue;; esac; ");
-        sb.append("st=$(stat -c '%s:%Y' \"$f\" 2>/dev/null); ");
-        sb.append("[ -n \"$st\" ] && printf 'LUNA_MDL=%s:download/%s\\n' \"$st\" \"$f\"; ");
-        sb.append("done; done; fi; ");
+        StageCmd.appendEnumerateMdl(sb);
         sb.append("set --; ");
         for (String sub : StageCmd.META_SUB) {
             sb.append("if [ -e \"$BASE/").append(sub).append("\" ]; then set -- \"$@\" ")

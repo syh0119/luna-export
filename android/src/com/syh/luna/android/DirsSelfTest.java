@@ -57,6 +57,9 @@ public final class DirsSelfTest {
         fail += check("★tar 清单不再打包 files/music（免搬运数 GB）",
                 !tcmd.contains("set -- \"$@\" files/music"));
         fail += check("★tar 命令输出 LUNA_MDL 元清单", tcmd.contains("LUNA_MDL="));
+        fail += check("★HEAD_BYTES 调整为 128 KB", StageCmd.HEAD_BYTES == 128 * 1024);
+        fail += check("★枚举使用 find -exec stat 批量执行",
+                tcmd.contains("find . -maxdepth 1 -type f") && tcmd.contains("-exec stat -c"));
         int sc = shellSyntax("tar 命令 sh -n 通过", tcmd);
         if (sc >= 0) fail += sc;
 
@@ -127,6 +130,8 @@ public final class DirsSelfTest {
         }
         fail += check("★cp 清单不再搬运 files_music", !ccmd.contains("$S/files_music"));
         fail += check("★cp 命令输出 LUNA_MDL 元清单", ccmd.contains("LUNA_MDL="));
+        fail += check("★cp 枚举使用 find -exec stat 与 grep -E",
+                ccmd.contains("find \"$d\" -maxdepth 1 -type f -exec stat") && ccmd.contains("grep -E"));
         sc = shellSyntax("cp 命令 sh -n 通过", ccmd);
         if (sc >= 0) fail += sc;
 
